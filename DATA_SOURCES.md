@@ -1,0 +1,88 @@
+# DakiKobo Data Sources Register
+
+This register tracks source quality before any document enters the RAG corpus.
+
+Only reviewed Markdown under `Data/markdown/` should power the app. Raw research
+outputs, scraped pages, or model-generated packs must stay outside the active RAG
+path until reviewed.
+
+## Status Labels
+
+| Status | Meaning |
+|---|---|
+| `active_rag` | Already part of the reviewed Markdown/PDF corpus. |
+| `candidate` | Good source candidate, but still needs clean extraction/review. |
+| `pending` | Needs title/date/publisher/content verification before use. |
+| `comparative` | Useful context, but not Burkina-specific. Label clearly if used. |
+| `reject` | Do not ingest. |
+
+## Candidate Sources To Extract Carefully
+
+| Status | Date added | Source | Publisher / year | Scope | Topics | License / usage note | Review status | Notes |
+|---|---|---|---|---|---|---|---|---|
+| `pending_review` | 2026-06-27 | [Catalogue de fiches techniques des mesures d'amélioration de la fertilité des sols](https://www.inter-reseaux.org/wp-content/uploads/Catalogue-AFS-ProSol-04-12-2020.pdf) | ProSol, 2020 | Burkina Faso | fumure organique, compost, parcs améliorés, légumineuses, CES | unknown | reviewed_by_codex_pending_human_review | Extracted to `Data/markdown/prosol_fertilite_sols_burkina_2020.md`; pesticide section excluded and exact microdose table kept out of general RAG advice. Ineligible for RAG until human agronomic review (see `Data/reviews/AGRONOMIST_REVIEW_PACKET_2026-09-12.md`). |
+| `pending_review` | 2026-06-27 | [Guide sur la production du niébé en Afrique de l'Ouest](https://cgspace.cgiar.org/items/26504a5f-1844-4773-ad7d-6f86b8bead17) | IITA, copyright 2017, citation 2018 | West Africa | niébé production, varieties, pests, storage | copyright IITA 2017; reuse terms not fully verified | reviewed_by_codex_pending_human_review | Extracted to `Data/markdown/iita_niebe_afrique_ouest_2018.md`; chemical product tables excluded and source kept labeled as regional. Original verified 2026-09-12 (SHA-256 in the review packet); ineligible for RAG until human agronomic review. |
+| `quarantined` | 2026-07-03 | [FAO Burkina Faso MAFAP / AGRISurvey / Country Profiles seed batch](https://www.fao.org/in-action/mafap/where-we-work/burkina-faso/en) | FAO, accessed 2026 | Burkina Faso | policy, public expenditure, price incentives, EPA/statistics, country profile | FAO web reuse terms not fully verified | rights_unclear (2026-09-12) | Curated synthesis in `Data/markdown/scraped_reviewed/fao_burkina_policy_data_profile_2026.md` is explicitly quarantined (`review_status: rights_unclear`): never indexed until FAO reuse terms are confirmed. Quarantine wins over any approval flag. |
+| `active_rag` | 2026-07-10 | [MAERAH OAPH 2023-2025 + projets/programmes](https://www.agriculture.bf/offensive-agropastorale-et-halieutique-2023-2025/) | MAERAH Burkina Faso, verified 2026-07-10 | Burkina Faso | national program OAPH, 8 strategic value chains, ministry orientation, public projects list | short public-web orientation summary + URL citation; ministry keeps full page rights | reviewed_by_owner (morawa-dev, 2026-07-10) | Curated synthesis in `Data/markdown/scraped_reviewed/maerah_oaph_orientation_burkina_2026.md`. OAPH expansion + filières verified vs official page. Sign-off: `Data/reviews/OWNER_SIGNOFF.md`. No fertilizer doses. |
+| `active_rag` | 2026-07-10 | [CILSS portail](https://www.cilss.int/) | CILSS, verified 2026-07-10 | Sahel / West Africa | regional resilience, food security institution | short public-web orientation summary + URL citation; CILSS keeps full portal rights | reviewed_by_owner (morawa-dev, 2026-07-10) | Curated synthesis in `Data/markdown/scraped_reviewed/cilss_orientation_sahel_2026.md`. AGRHYMET/WASCAL still unreachable; not promoted. |
+| `candidate` | 2026-06-27 | [ProPulse Légumineuses](https://agritrop.cirad.fr/612314/1/V2COR200225%20PROPULSE%20L%C3%89GUMINEUSES%20.pdf) | CIRAD / partners, PDF created 2025 | Burkina Faso and West Africa | cereal-legume associations, rotations, legumes | unknown | pending_human_review | Useful where the document explicitly supports Burkina sections. Extract cautiously by section. |
+
+## Pending Sources
+
+| Status | Date added | Source | Claimed use | License / usage note | Review status | What to verify |
+|---|---|---|---|---|---|---|
+| `pending` | 2026-06-27 | [JICA report 1000040845](https://openjicareport.jica.go.jp/pdf/1000040845.pdf) | Burkina Faso agricultural calendar/table | unknown | pending_verification | Verify exact title, publication date, country scope, and the claimed calendar table before using. |
+| `pending` | 2026-06-27 | ResearchGate climate/pluviometry page | climate zones and rainfall variability | unknown | pending_verification | Replace with canonical journal, DOI, institutional PDF, or author repository before ingestion. |
+| `pending` | 2026-06-27 | Webonary Fulfulde Burkina | local-language glossary | unknown | pending_verification | Fulfulde-only URL does not prove Dioula/Mooré terms. Build language-specific sources and human review. |
+
+## Comparative Or Rejected Sources From Deep Research Audit
+
+| Status | Date added | Source | License / usage note | Review status | Reason |
+|---|---|---|---|---|---|
+| `comparative` | 2026-06-27 | [Fiche de production et de commercialisation du sorgho, Mali](https://ag.purdue.edu/department/agecon/_docs/international-programs/ipim-sahel-french/fiche-technique-sorgo.pdf) | unknown | reviewed_for_rejection | Verified as Mali, March 2011. Do not label as Burkina Faso or 2023. |
+| `comparative` | 2026-06-27 | [IFDC / ACMA2 itinéraire technique du maïs](https://ifdc.org/wp-content/uploads/2019/07/FICHE-TECHNIQUE-1-ITINERAIRE-TECHNIQUE-DU-MAI%CC%88S-MAIZE-TECHNICAL-ITINERARY.pdf) | unknown | reviewed_for_rejection | Verified as IFDC/ACMA2 Benin context, PDF metadata 2019. Do not label as INERA/FAO/Burkina 2023. |
+| `reject` | 2026-06-27 | `Data/_archive/rejected_deep_research_2026-06-27/iaskpro.md` | internal generated output | reviewed_for_rejection | Synthetic guide with only a homepage source URL and unsupported exact claims. |
+| `reject` | 2026-06-27 | `Data/_archive/rejected_deep_research_2026-06-27/gemini_deep_res_results.md` | internal generated output | reviewed_for_rejection | Useful themes but wrong dates/publishers/countries and malformed pack. Use audit only, not content. |
+| `reject` | 2026-06-27 | `Data/_archive/rejected_deep_research_2026-06-27/deep_research_result_by_chatgpt_dakikobo.md` | internal generated output | reviewed_for_rejection | Off-topic failed run. |
+| `reject` | 2026-06-27 | [Scribd FT de l'Arachide](https://fr.scribd.com/document/858694378/FT-de-l-Arachide) | third-party user upload | reviewed_for_rejection | User-upload source with unclear provenance. Find original publisher instead. |
+
+## Ingestion Rules
+
+1. A source must have verified title, publisher, year or explicit `null`, direct URL, and country/region.
+2. `West Africa regional` sources can support general advice but must not be presented as Burkina official recommendations.
+3. Exact fertilizer doses, pesticide names, crop calendars, and disease treatment advice need source-backed extraction plus human review.
+4. Firecrawl output is raw material, not truth. Scraped Markdown must keep URL, crawl date, publisher, and review status.
+5. Accepted documents move into `Data/markdown/` only after review.
+6. Firecrawl candidates belong in `Data/scraped/pending/`; reviewed promoted copies belong in `Data/markdown/scraped_reviewed/`.
+7. Firecrawl scraping uses `Data/scraped/source_allowlist.csv` by default; unlisted URLs require an explicit `--allow-unlisted` experiment and must not be promoted without review.
+
+## Firecrawl Allowlist And Seed Batch
+
+- Allowlist: `Data/scraped/source_allowlist.csv`
+- First seed batch (FAO): `Data/scraped/seed_urls_fao_burkina.txt`
+- Expanded trusted seeds (ministry / INERA / WASCAL / AGRHYMET / CILSS):
+  `Data/scraped/seed_urls_trusted_bf.txt`
+- Allowlist expanded 2026-07-10 for:
+  - `agriculture.bf` / `www.agriculture.bf` (ministry)
+  - `inera.bf` / `inera.org` patterns
+  - WASCAL, AGRHYMET, CILSS climate/agriculture pages
+- Scraped pages remain **pending** until human promotion into
+  `Data/markdown/scraped_reviewed/`.
+- Allowlist matching treats `https://example.org/*` as also covering the site root
+  (`https://example.org` / `https://example.org/`).
+- Offline scrape log 2026-07-10:
+  - FAO country profile seed → pending Markdown written (review before promote).
+  - WASCAL homepage → Firecrawl proxy/site load error (retry later).
+  - Use `python scripts/firecrawl_ingest.py --trusted-batch` for the expanded seed list.
+- Current seed scope: FAO Burkina Faso MAFAP, FAO AGRISurvey Burkina Faso, and FAO Country Profiles Burkina Faso.
+- Local pending outputs generated on 2026-07-02 UTC are ignored by git under `Data/scraped/pending/*.md`.
+- Reviewed output promoted on 2026-07-03: `Data/markdown/scraped_reviewed/fao_burkina_policy_data_profile_2026.md`.
+  **Reversed on 2026-09-12:** the synthesis is now quarantined (`review_status: rights_unclear`)
+  because FAO web reuse terms remain unverified; it is excluded from RAG.
+
+## Next Source Work
+
+1. Extract verified Burkina sections from CIRAD ProPulse 2025.
+2. Search for original official arachide and climate sources to replace weak citations.
+3. Confirm FAO web reuse terms; only then may the quarantined FAO synthesis return to review.
+4. Use `scripts/firecrawl_ingest.py` only for offline candidate collection, never during user requests.

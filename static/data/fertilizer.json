@@ -1,0 +1,165 @@
+{
+  "schema_version": 2,
+  "updated_at": "2026-09-06T00:00:00Z",
+  "review_expires_at": "2026-12-05T00:00:00Z",
+  "registry": [
+    {
+      "id": "sorgho",
+      "aliases": [
+        "sorgho",
+        "sorghum"
+      ]
+    },
+    {
+      "id": "mil",
+      "aliases": [
+        "mil",
+        "millet",
+        "petit mil"
+      ]
+    },
+    {
+      "id": "mais",
+      "aliases": [
+        "maïs",
+        "mais",
+        "maize"
+      ]
+    },
+    {
+      "id": "niebe",
+      "aliases": [
+        "niébé",
+        "niebe",
+        "cowpea",
+        "haricot"
+      ]
+    },
+    {
+      "id": "arachide",
+      "aliases": [
+        "arachide",
+        "arachides",
+        "groundnut",
+        "cacahuète",
+        "cacahuete"
+      ]
+    },
+    {
+      "id": "soja",
+      "aliases": [
+        "soja",
+        "soya",
+        "soybean"
+      ]
+    },
+    {
+      "id": "coton",
+      "aliases": [
+        "coton"
+      ]
+    },
+    {
+      "id": "riz",
+      "aliases": [
+        "riz"
+      ]
+    },
+    {
+      "id": "sesame",
+      "aliases": [
+        "sésame",
+        "sesame"
+      ]
+    },
+    {
+      "id": "fonio",
+      "aliases": [
+        "fonio"
+      ]
+    }
+  ],
+  "disclaimer": "⚠️ Ce sont des recommandations générales issues de la recherche (INERA). Confirmez toujours avec votre agent agricole : la bonne dose dépend de votre sol, de la pluie et de vos moyens. Les références détaillées des doses restent à vérifier : ces repères ne sont pas une prescription pour votre parcelle.",
+  "keywords": [
+    "engrais",
+    "fumure",
+    "fertilis",
+    "npk",
+    "urée",
+    "uree",
+    "dose d'engrais",
+    "dose d engrais",
+    "fertilizer",
+    "microdose",
+    "micro-dose"
+  ],
+  "crops": {
+    "sorgho": {
+      "label": "le sorgho",
+      "aliases": [
+        "sorgho",
+        "sorghum"
+      ],
+      "available": false,
+      "lines": [
+        "Les doses exactes sont temporairement retirées : leur source, leur formulation et leurs conditions d’application doivent encore être vérifiées par un agronome. Demandez la dose adaptée à votre agent agricole avant toute application."
+      ],
+      "sources": []
+    },
+    "mil": {
+      "label": "le mil",
+      "aliases": [
+        "mil",
+        "millet",
+        "petit mil"
+      ],
+      "available": false,
+      "lines": [
+        "Les doses exactes sont temporairement retirées : leur source, leur formulation et leurs conditions d’application doivent encore être vérifiées par un agronome. Demandez la dose adaptée à votre agent agricole avant toute application."
+      ],
+      "sources": []
+    },
+    "mais": {
+      "label": "le maïs",
+      "aliases": [
+        "maïs",
+        "mais",
+        "maize"
+      ],
+      "available": false,
+      "lines": [
+        "Les doses exactes sont temporairement retirées : leur source, leur formulation et leurs conditions d’application doivent encore être vérifiées par un agronome. Demandez la dose adaptée à votre agent agricole avant toute application."
+      ],
+      "sources": []
+    },
+    "niebe": {
+      "label": "le niébé",
+      "aliases": [
+        "niébé",
+        "niebe",
+        "cowpea",
+        "haricot"
+      ],
+      "available": false,
+      "lines": [
+        "Les doses exactes sont temporairement retirées : leur source, leur formulation et leurs conditions d’application doivent encore être vérifiées par un agronome. Demandez la dose adaptée à votre agent agricole avant toute application."
+      ],
+      "sources": []
+    },
+    "arachide": {
+      "label": "l'arachide",
+      "aliases": [
+        "arachide",
+        "arachides",
+        "groundnut",
+        "cacahuète",
+        "cacahuete"
+      ],
+      "available": false,
+      "lines": [
+        "Les doses exactes sont temporairement retirées : leur source, leur formulation et leurs conditions d’application doivent encore être vérifiées par un agronome. Demandez la dose adaptée à votre agent agricole avant toute application."
+      ],
+      "sources": []
+    }
+  }
+}

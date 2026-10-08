@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "dakikobo-repository": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "."
+      ],
+      "disabled": false
+    }
+  }
+}

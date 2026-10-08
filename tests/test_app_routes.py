@@ -1,0 +1,2805 @@
+"""Flask route smoke tests with live services mocked out."""
+
+import json
+from pathlib import Path
+import logging
+from threading import Thread
+from types import SimpleNamespace
+
+import pytest
+
+import app as app_module
+import core.disease as disease
+from core.answer_safety import REDACTION_NOTICE
+from core.case_log import list_evidence, list_feedback_events, record_feedback
+from core.retrieval import chunk_id, get_active_manifest_hash, manifest_hash
+
+
+@pytest.fixture(autouse=True)
+def _isolate_case_log(tmp_path, monkeypatch):
+    """Route tests must never append synthetic rows to the developer journal."""
+    monkeypatch.setattr(
+        app_module,
+        "CASE_LOG_DB",
+        str(tmp_path / "route_case_log.sqlite3"),
+    )
+
+
+def _query_starts_with(query: str, expected: str) -> None:
+    """Resolved queries may append culture/lieu hints after the user text."""
+    assert (query or "").startswith(expected), query
+
+
+class _FakeRagChain:
+    def invoke(self, query):
+        _query_starts_with(query, "Quand semer le mil ?")
+        return {
+            "result": "Semez le mil au début de la saison des pluies.",
+            "source_documents": [
+                SimpleNamespace(
+                    metadata={"source": "guide_mil.pdf"},
+                    page_content="Semez le mil au début de la saison des pluies.",
+                ),
+                SimpleNamespace(
+                    metadata={"source": "guide_mil.pdf"},
+                    page_content="Le semis du mil suit une pluie utile.",
+                ),
+                SimpleNamespace(
+                    metadata={"source": "calendrier.pdf"},
+                    page_content="Calendrier de semis du mil au Burkina Faso.",
+                ),
+            ],
+        }
+
+
+class _SingleSourceRagChain:
+    def invoke(self, query):
+        _query_starts_with(query, "Quand semer le mil ?")
+        return {
+            "result": "Semez le mil au début de la saison des pluies.",
+            "source_documents": [
+                SimpleNamespace(metadata={"source": "guide_mil.pdf"}),
+            ],
+        }
+
+
+class _MetadataSourceRagChain:
+    def invoke(self, query):
+        _query_starts_with(query, "Quelles données FAO existent ?")
+        return {
+            "result": "La FAO signale AGRISurvey, FAOSTAT et CountrySTAT.",
+            "source_documents": [
+                SimpleNamespace(
+                    metadata={
+                        "source": "FAO Burkina Faso - politiques agricoles",
+                        "doc_type": "scraped_web",
+                        "publisher": "FAO",
+                        "year": "2026",
+                        "country": "Burkina Faso",
+                        "review_status": "reviewed_by_codex_pending_human_review",
+                        "scope": "Cadre national d'orientation ; ne pas utiliser pour des doses.",
+                        "source_url": "https://www.fao.org/in-action/mafap/where-we-work/burkina-faso/en",
+                    },
+                    page_content="La FAO signale AGRISurvey, FAOSTAT et CountrySTAT pour le Burkina Faso.",
+                )
+            ],
+        }
+
+
+class _NoisySourceRagChain:
+    def invoke(self, query):
+        _query_starts_with(query, "Comment stocker le niébé contre les bruches ?")
+        return {
+            "result": "Utilisez des sacs PICS avec des grains bien secs.",
+            "source_documents": [
+                SimpleNamespace(
+                    metadata={"source": "Source faible"},
+                    page_content="Contenu secondaire peu lié au niébé.",
+                ),
+                SimpleNamespace(
+                    metadata={"source": "IITA 2018 - Production du niebe"},
+                    page_content="Les sacs PICS permettent un stockage hermétique non chimique du niébé.",
+                ),
+                SimpleNamespace(
+                    metadata={"source": "Source moyenne"},
+                    page_content="Stockage et séchage des grains.",
+                ),
+            ],
+        }
+
+
+class _RefusalRagChain:
+    """Returns the grounded 'I don't know' fallback with off-topic chunks."""
+    def invoke(self, query):
+        return {
+            "result": (
+                "Je ne sais pas encore. Cette information n'est pas disponible "
+                "dans la base de données de DakiKobo pour le Burkina Faso."
+            ),
+            "source_documents": [
+                SimpleNamespace(metadata={"source": "agrobusiness.pdf"}),
+                SimpleNamespace(metadata={"source": "manuel.pdf"}),
+            ],
+        }
+
+
+class _NoSourceRagChain:
+    """Returns an answer even though retrieval found no documents."""
+    def invoke(self, query):
+        return {
+            "result": "Réponse non fondée.",
+            "source_documents": [],
+        }
+
+
+class _UncertainRagChain:
+    """Returns the first-class 'Je ne peux pas confirmer' uncertainty path."""
+    def invoke(self, query):
+        return {
+            "result": (
+                "Je ne peux pas confirmer. Les documents évoquent des pratiques "
+                "générales, mais le stade et la parcelle manquent. Vérifiez au "
+                "champ et demandez conseil à un agent agricole."
+            ),
+            "source_documents": [
+                SimpleNamespace(
+                    metadata={"source": "guide_general.pdf"},
+                    page_content="Pratiques générales de culture au Sahel.",
+                ),
+            ],
+        }
+
+
+class _RagHarness:
+    """Adapt legacy test responses to the one-search RetrievalQA seam."""
+
+    def __init__(self, legacy_chain, scores=None):
+        self.legacy_chain = legacy_chain
+        self.scores = scores or {}
+        self.combine_documents_chain = self
+        self.search_calls = []
+        self.combined_docs = None
+        self._response = None
+
+    def similarity_search_with_relevance_scores(self, query, k):
+        self.search_calls.append((query, k))
+        self._response = self.legacy_chain.invoke(query)
+        return [
+            (
+                doc,
+                self.scores.get(
+                    (getattr(doc, "metadata", {}) or {}).get("source", "Inconnu"),
+                    0.4,
+                ),
+            )
+            for doc in self._response.get("source_documents", [])
+        ]
+
+    def run(self, *, input_documents, question):
+        assert self._response is not None
+        expected_docs = self._response.get("source_documents", [])
+        assert input_documents == [
+            doc
+            for doc in expected_docs
+            if self.scores.get(
+                (getattr(doc, "metadata", {}) or {}).get("source", "Inconnu"),
+                0.4,
+            )
+            >= app_module.SIMILARITY_THRESHOLD
+        ]
+        self.combined_docs = input_documents
+        return self._response["result"]
+
+
+def _install_rag(monkeypatch, legacy_chain, scores=None):
+    harness = _RagHarness(legacy_chain, scores=scores)
+    # Route-policy tests exercise live generation; answer-cache behavior has a
+    # dedicated Phase 3 integration test.
+    monkeypatch.setattr(app_module, "ANSWER_CACHE_ENABLED", False)
+    monkeypatch.setattr(app_module, "get_rag_chain", lambda: harness)
+    monkeypatch.setattr(app_module, "_rag_db", harness)
+    return harness
+
+
+def test_app_import_does_not_initialize_rag():
+    assert app_module._rag_chain is None
+
+
+def test_index_route_renders():
+    client = app_module.app.test_client()
+    response = client.get("/")
+    assert response.status_code == 200
+    assert response.content_type.startswith("text/html")
+    assert b'data-example-id="semis_mil"' in response.data
+    assert b'data-example-id="oaph_burkina"' in response.data
+    assert b'data-example-id="cilss_sahel"' in response.data
+    assert b'data-example-id="hors_sujet"' in response.data
+    assert b'data-example-id="photo_mais"' in response.data
+    assert b'id="credibilityToggle"' in response.data
+    assert b'id="credibilityModal"' in response.data
+    assert b'Sources & limites' in response.data
+    assert b'id="toolsDrawer"' in response.data
+    assert b'id="toolsToggle"' in response.data
+    assert b'id="weatherLocation"' in response.data
+    assert b'id="soilCrop"' in response.data
+    assert b'id="mediaPrivacyNote"' in response.data
+
+
+def test_privacy_policy_route_renders_french_page():
+    client = app_module.app.test_client()
+    response = client.get("/confidentialite")
+    assert response.status_code == 200
+    assert response.content_type.startswith("text/html")
+    assert "Politique de confidentialité".encode() in response.data
+    assert b'Mes conseils' in response.data
+    # Retention is rendered from configuration, not hardcoded.
+    assert str(app_module.JOURNAL_RETENTION_DAYS).encode() in response.data
+
+
+def test_index_links_to_privacy_policy():
+    client = app_module.app.test_client()
+    response = client.get("/")
+    assert response.status_code == 200
+    assert b'href="/confidentialite"' in response.data
+
+
+def test_health_route_is_lightweight():
+    client = app_module.app.test_client()
+    response = client.get("/healthz")
+    payload = response.get_json()
+    assert response.status_code == 200
+    assert payload["ok"] is True
+    assert payload["bot"] == "DakiKobo"
+    assert payload["rag_ready"] is False
+    assert payload["rag_status"] in {"cold", "warming", "ready", "error"}
+    assert payload["rag_warmup"]["status"] == payload["rag_status"]
+
+
+def test_rag_runtime_status_does_not_wait_for_initialization_lock(monkeypatch):
+    result = {}
+    monkeypatch.setattr(app_module, "_rag_chain", None)
+    monkeypatch.setattr(app_module, "_rag_warmup_started", True)
+    monkeypatch.setattr(app_module, "_rag_warmup_error", None)
+
+    app_module._rag_lock.acquire()
+    try:
+        reader = Thread(
+            target=lambda: result.update(app_module._rag_runtime_status()),
+            daemon=True,
+        )
+        reader.start()
+        reader.join(timeout=0.5)
+        assert not reader.is_alive(), "readiness status waited for the RAG build lock"
+    finally:
+        app_module._rag_lock.release()
+
+    assert result["status"] == "warming"
+
+
+def test_crop_labels_route_returns_french_crops():
+    client = app_module.app.test_client()
+    response = client.get("/crop-labels")
+    payload = response.get_json()
+    assert response.status_code == 200
+    assert payload["primary_language"] == "fr"
+    ids = {c["id"] for c in payload["crops"]}
+    assert "mil" in ids
+    assert "maïs" in ids
+    assert "niébé" in ids
+    assert all(c.get("fr") for c in payload["crops"])
+
+
+def test_crop_labels_error_is_stable_french_and_hides_internal_detail(monkeypatch):
+    monkeypatch.setattr(
+        app_module,
+        "load_crop_labels",
+        lambda: (_ for _ in ()).throw(ValueError("internal path detail")),
+    )
+
+    response = app_module.app.test_client().get("/crop-labels")
+
+    assert response.status_code == 500
+    assert response.get_json()["error"] == (
+        "Les libellés des cultures sont indisponibles pour le moment."
+    )
+    assert "internal" not in response.get_data(as_text=True)
+
+
+def test_version_route_reports_runtime_metadata(monkeypatch):
+    client = app_module.app.test_client()
+    monkeypatch.setenv("APP_COMMIT_SHA", "abc123")
+
+    response = client.get("/version")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["bot"] == "DakiKobo"
+    assert payload["app_version"]
+    assert payload["commit"] == "abc123"
+    assert payload["rag_status"] in {"cold", "warming", "ready", "error"}
+    assert payload["config"]["llm_model"]
+    assert payload["config"]["embedding_model"] == "paraphrase-multilingual-MiniLM-L12-v2"
+    assert payload["config"]["prefer_markdown_kb"] is True
+
+
+def test_ask_route_emits_privacy_safe_structured_log(caplog):
+    client = app_module.app.test_client()
+    caplog.set_level(logging.INFO, logger="dakikobo")
+
+    response = client.post("/ask", data={"messageText": "qui es-tu ?"})
+
+    records = [record for record in caplog.records if record.name == "dakikobo"]
+    payload = json.loads(records[-1].message)
+
+    assert response.status_code == 200
+    assert payload["event"] == "http_request"
+    assert payload["route"] == "/ask"
+    assert payload["method"] == "POST"
+    assert payload["status_code"] == 200
+    assert payload["feature"] == "ask"
+    assert payload["intent"] == "identity"
+    assert payload["model"] == "static"
+    assert payload["confidence"] == "Fort"
+    assert payload["source_count"] == 0
+    assert isinstance(payload["latency_ms"], float)
+    assert "qui es-tu" not in payload.values()
+    assert "answer" not in payload
+    assert "question" not in payload
+
+
+def test_validation_error_log_includes_failure_type(caplog):
+    client = app_module.app.test_client()
+    caplog.set_level(logging.INFO, logger="dakikobo")
+
+    response = client.post("/ask", data={})
+
+    records = [record for record in caplog.records if record.name == "dakikobo"]
+    payload = json.loads(records[-1].message)
+
+    assert response.status_code == 400
+    assert payload["route"] == "/ask"
+    assert payload["status_code"] == 400
+    assert payload["outcome"] == "validation_error"
+    assert payload["failure_type"] == "empty_question"
+    assert payload["confidence"] == "Faible"
+
+
+def test_rag_warmup_starts_once(monkeypatch):
+    calls = []
+
+    class ImmediateThread:
+        def __init__(self, target, args=(), daemon=False):
+            self.target = target
+            self.args = args
+            self.daemon = daemon
+
+        def start(self):
+            self.target(*self.args)
+
+    monkeypatch.setattr(app_module, "_rag_chain", None)
+    monkeypatch.setattr(app_module, "_rag_warmup_started", False)
+    monkeypatch.setattr(app_module, "_rag_warmup_started_at", None)
+    monkeypatch.setattr(app_module, "_rag_warmup_finished_at", None)
+    monkeypatch.setattr(app_module, "_rag_warmup_error", None)
+    monkeypatch.setattr(app_module, "Thread", ImmediateThread)
+    monkeypatch.setattr(app_module, "get_rag_chain", lambda: calls.append("warm"))
+
+    assert app_module.start_rag_warmup("test") is True
+    assert calls == ["warm"]
+    assert app_module._rag_warmup_started is True
+    assert app_module._rag_warmup_finished_at is not None
+
+    assert app_module.start_rag_warmup("again") is False
+    assert calls == ["warm"]
+
+
+def test_local_knowledge_prefers_markdown(monkeypatch):
+    markdown_docs = [SimpleNamespace(page_content="markdown")]
+
+    def fail_pdf_loader(folder):
+        raise AssertionError("PDF fallback should not run when Markdown exists")
+
+    monkeypatch.setattr(app_module, "PREFER_MARKDOWN_KB", True)
+    monkeypatch.setattr(app_module, "load_markdown_from_folder", lambda folder: markdown_docs)
+    monkeypatch.setattr(app_module, "load_pdfs_from_folder", fail_pdf_loader)
+
+    docs, source = app_module._load_local_knowledge_documents()
+
+    assert docs == markdown_docs
+    assert source == "Markdown"
+
+
+def test_local_knowledge_falls_back_to_pdfs_when_markdown_missing(monkeypatch):
+    pdf_docs = [SimpleNamespace(page_content="pdf")]
+
+    monkeypatch.setattr(app_module, "PREFER_MARKDOWN_KB", True)
+    monkeypatch.setattr(app_module, "load_markdown_from_folder", lambda folder: [])
+    monkeypatch.setattr(app_module, "load_pdfs_from_folder", lambda folder: pdf_docs)
+
+    docs, source = app_module._load_local_knowledge_documents()
+
+    assert docs == pdf_docs
+    assert source == "PDF"
+
+
+def test_existing_valid_vector_store_is_reused(monkeypatch):
+    db = object()
+
+    monkeypatch.setattr(app_module, "REBUILD_VECTORSTORE", False)
+    monkeypatch.setattr(app_module, "vector_store_exists", lambda: True)
+    monkeypatch.setattr(app_module, "_expected_vector_store_manifest", lambda: {"files": []})
+    monkeypatch.setattr(app_module, "load_vector_store_if_usable", lambda manifest: db)
+    monkeypatch.setattr(
+        app_module,
+        "initialize_vector_store",
+        lambda docs, manifest=None: (_ for _ in ()).throw(
+            AssertionError("valid store should load")
+        ),
+    )
+
+    assert app_module._load_or_build_vector_store() is db
+    assert get_active_manifest_hash() == manifest_hash({"files": []})
+
+
+def test_invalid_existing_vector_store_is_rebuilt(monkeypatch):
+    calls = []
+    local_docs = [SimpleNamespace(page_content="markdown")]
+
+    monkeypatch.setattr(app_module, "REBUILD_VECTORSTORE", False)
+    monkeypatch.setattr(app_module, "KNOWLEDGE_URLS", [])
+    monkeypatch.setattr(app_module, "vector_store_exists", lambda: True)
+    monkeypatch.setattr(app_module, "_expected_vector_store_manifest", lambda: {"files": []})
+    monkeypatch.setattr(app_module, "load_vector_store_if_usable", lambda manifest: None)
+    monkeypatch.setattr(app_module, "clear_vector_store", lambda: calls.append("clear"))
+    monkeypatch.setattr(
+        app_module,
+        "_load_local_knowledge_documents",
+        lambda: (local_docs, "Markdown"),
+    )
+    monkeypatch.setattr(
+        app_module,
+        "initialize_vector_store",
+        lambda docs, manifest=None: {"doc_count": len(docs), "manifest": manifest},
+    )
+
+    db = app_module._load_or_build_vector_store()
+
+    assert calls == ["clear"]
+    assert db == {"doc_count": 1, "manifest": {"files": []}}
+    assert get_active_manifest_hash() == manifest_hash({"files": []})
+
+
+def test_rebuild_clears_existing_vector_store(monkeypatch):
+    calls = []
+    local_docs = [SimpleNamespace(page_content="markdown")]
+
+    monkeypatch.setattr(app_module, "REBUILD_VECTORSTORE", True)
+    monkeypatch.setattr(app_module, "KNOWLEDGE_URLS", [])
+    monkeypatch.setattr(app_module, "vector_store_exists", lambda: True)
+    monkeypatch.setattr(app_module, "_expected_vector_store_manifest", lambda: {"files": []})
+    monkeypatch.setattr(app_module, "clear_vector_store", lambda: calls.append("clear"))
+    monkeypatch.setattr(
+        app_module,
+        "_load_local_knowledge_documents",
+        lambda: (local_docs, "Markdown"),
+    )
+    monkeypatch.setattr(
+        app_module,
+        "initialize_vector_store",
+        lambda docs, manifest=None: {"doc_count": len(docs), "manifest": manifest},
+    )
+
+    db = app_module._load_or_build_vector_store()
+
+    assert calls == ["clear"]
+    assert db == {"doc_count": 1, "manifest": {"files": []}}
+    assert get_active_manifest_hash() == manifest_hash({"files": []})
+
+
+def test_demo_example_route_returns_text_case_card(monkeypatch):
+    client = app_module.app.test_client()
+    response = client.get("/examples/semis_mil")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["case"]["input_type"] == "text"
+    assert payload["case"]["summary"]
+    assert payload["case"]["case_title"] == "Conseil agricole"
+
+
+def test_demo_example_route_returns_text_without_live_services(monkeypatch):
+    client = app_module.app.test_client()
+    monkeypatch.setattr(
+        app_module,
+        "get_rag_chain",
+        lambda: (_ for _ in ()).throw(AssertionError("RAG should not run")),
+    )
+    monkeypatch.setattr(
+        app_module,
+        "text_to_speech_to_static",
+        lambda text: (_ for _ in ()).throw(AssertionError("TTS should not run")),
+    )
+
+    response = client.get("/examples/semis_mil")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["kind"] == "message"
+    assert payload["question"] == "Quand semer le mil ?"
+    assert payload["answer"]
+    assert payload["sources"][0]["type"] == "Base locale"
+    assert payload["confidence"] == "Moyen"
+    assert payload["audio_url"] == ""
+
+
+def test_demo_example_route_returns_fertilizer_case():
+    client = app_module.app.test_client()
+
+    response = client.get("/examples/fumure_sorgho")
+    payload = response.get_json()
+
+    # The example is produced by the deterministic gate, so while numeric
+    # guidance is unverified it shows the gated refusal — never exact figures.
+    assert response.status_code == 200
+    assert payload["kind"] == "message"
+    assert payload["answer_kind"] == "refusal"
+    assert payload["confidence"] == "Faible"
+    assert "100 kg/ha" not in payload["answer"]
+    assert "14-23-14" not in payload["answer"]
+    assert "kg/ha" not in payload["answer"]
+    assert payload["sources"] == []
+    assert payload["case"] is None
+    assert payload["journal"]["answer_path"] == "fertilizer"
+    # It matches exactly what the deterministic tool returns for the same query.
+    from core.fertilizer import get_fertilizer_advice
+
+    assert payload["answer"] == get_fertilizer_advice(
+        "Quelle dose d'engrais pour le sorgho ?"
+    )["answer"]
+
+
+def test_demo_example_oaph_uses_correct_expansion():
+    client = app_module.app.test_client()
+    response = client.get("/examples/oaph_burkina")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert "Offensive Agropastorale et Halieutique" in payload["answer"]
+    assert "Office des" not in payload["answer"]
+    assert payload["confidence"] == "Fort"
+    assert "MAERAH" in payload["sources"][0]["title"]
+    assert payload["case"]["input_type"] == "text"
+
+
+def test_demo_example_cilss_and_off_topic_refusal():
+    client = app_module.app.test_client()
+
+    cilss = client.get("/examples/cilss_sahel").get_json()
+    assert "CILSS" in cilss["answer"] or "secheresse" in cilss["answer"].lower() or "sécheresse" in cilss["answer"].lower()
+    assert cilss["sources"]
+    assert cilss["case"]["input_type"] == "text"
+
+    off = client.get("/examples/hors_sujet").get_json()
+    assert off["answer_kind"] == "refusal"
+    assert "ne sais pas encore" in off["answer"].lower()
+    assert off.get("sources") == []
+    assert "case" not in off or not off.get("case")
+
+
+def test_demo_example_route_returns_image_case():
+    client = app_module.app.test_client()
+
+    response = client.get("/examples/photo_mais")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["kind"] == "case"
+    assert payload["case"]["case_id"] == "demo_photo_mais"
+    assert payload["case"]["crop"] == "maïs"
+    assert payload["case"]["sources"][0]["type"] == "Vision"
+    assert payload["confidence"] == "Moyen"
+
+
+def test_demo_example_route_404s_unknown_example():
+    client = app_module.app.test_client()
+
+    response = client.get("/examples/inconnu")
+    payload = response.get_json()
+
+    assert response.status_code == 404
+    assert payload["error"] == "Exemple introuvable."
+    assert payload["confidence"] == "Faible"
+
+
+def test_weather_locations_route_returns_burkina_choices():
+    client = app_module.app.test_client()
+
+    response = client.get("/weather/locations")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert {"id": "ouagadougou", "name": "Ouagadougou", "latitude": 12.3714, "longitude": -1.5197} in payload["locations"]
+
+
+def test_weather_route_returns_context(monkeypatch):
+    client = app_module.app.test_client()
+    weather_payload = {
+        "location": {"id": "bobo", "name": "Bobo-Dioulasso"},
+        "metrics": {"rain_7d_mm": 12.5},
+        "insights": [{"label": "Pluie utile (7 jours)", "status": "watch", "text": "Surveillez."}],
+        "sources": [{"title": "Open-Meteo Forecast API", "type": "Météo"}],
+    }
+    monkeypatch.setattr(
+        app_module,
+        "build_weather_context",
+        lambda location: weather_payload,
+    )
+
+    response = client.get("/weather?location=bobo")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["weather"] == weather_payload
+    assert payload["confidence"] == "Moyen"
+
+
+def test_weather_route_rejects_unknown_location(monkeypatch):
+    client = app_module.app.test_client()
+    monkeypatch.setattr(
+        app_module,
+        "build_weather_context",
+        lambda location: (_ for _ in ()).throw(ValueError("bad location")),
+    )
+
+    response = client.get("/weather?location=inconnu")
+    payload = response.get_json()
+
+    assert response.status_code == 400
+    assert "localité disponible" in payload["error"]
+    assert payload["confidence"] == "Faible"
+
+
+def test_weather_route_handles_api_error(monkeypatch):
+    client = app_module.app.test_client()
+    monkeypatch.setattr(
+        app_module,
+        "build_weather_context",
+        lambda location: (_ for _ in ()).throw(app_module.WeatherError("offline")),
+    )
+
+    response = client.get("/weather?location=bobo")
+    payload = response.get_json()
+
+    assert response.status_code == 502
+    assert "météo agricole" in payload["error"]
+    assert payload["confidence"] == "Faible"
+
+
+def test_soil_locations_route_returns_choices():
+    client = app_module.app.test_client()
+
+    response = client.get("/soil/locations")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert {"id": "bobo", "name": "Bobo-Dioulasso", "latitude": 11.1771, "longitude": -4.2979} in payload["locations"]
+    assert {"id": "sorgho", "name": "Sorgho"} in payload["crops"]
+
+
+def test_soil_route_combines_context_and_fertilizer(monkeypatch):
+    client = app_module.app.test_client()
+    soil_payload = {
+        "location": {"id": "bobo", "name": "Bobo-Dioulasso"},
+        "crop": "sorgho",
+        "depth": "0-5 cm",
+        "metrics": {"sand_percent": 72.0},
+        "data_available": True,
+        "indicators": [
+            {
+                "label": "Texture",
+                "status": "risk",
+                "value": "Tendance sableuse",
+                "text": "Rétention faible.",
+            }
+        ],
+        "disclaimer": "Test de sol requis.",
+        "sources": [{"title": "SoilGrids REST API", "type": "Sol"}],
+    }
+    monkeypatch.setattr(
+        app_module,
+        "build_soil_context",
+        lambda location, crop: soil_payload,
+    )
+
+    response = client.get("/soil?location=bobo&crop=sorgho")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["soil"] == soil_payload
+    assert "temporairement retirées" in payload["fertilizer"]["answer"]
+    assert payload["fertilizer"]["sources"] == []
+    assert payload["sources"][0]["type"] == "Sol"
+    assert len(payload["sources"]) == 1
+    assert payload["confidence"] == "Moyen"
+
+
+def test_soil_route_marks_missing_metrics_low_confidence(monkeypatch):
+    client = app_module.app.test_client()
+    soil_payload = {
+        "location": {"id": "ouagadougou", "name": "Ouagadougou"},
+        "crop": "maïs",
+        "depth": "0-5 cm",
+        "metrics": {
+            "clay_percent": None,
+            "sand_percent": None,
+            "soc_percent": None,
+            "ph_h2o": None,
+            "cec_cmol_kg": None,
+        },
+        "data_available": False,
+        "indicators": [
+            {
+                "label": "Rétention des nutriments",
+                "status": "watch",
+                "value": "Non disponible",
+                "text": "Impossible d'estimer la rétention.",
+            }
+        ],
+        "disclaimer": "Test de sol requis.",
+        "sources": [{"title": "SoilGrids REST API", "type": "Sol"}],
+    }
+    monkeypatch.setattr(
+        app_module,
+        "build_soil_context",
+        lambda location, crop: soil_payload,
+    )
+
+    response = client.get("/soil?location=ouagadougou&crop=maïs")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["soil"]["data_available"] is False
+    assert payload["confidence"] == "Faible"
+    assert payload["soil"]["indicators"][0]["value"] == "Non disponible"
+
+
+def test_soil_route_rejects_unknown_selection(monkeypatch):
+    client = app_module.app.test_client()
+    monkeypatch.setattr(
+        app_module,
+        "build_soil_context",
+        lambda location, crop: (_ for _ in ()).throw(ValueError("bad selection")),
+    )
+
+    response = client.get("/soil?location=inconnu&crop=coton")
+    payload = response.get_json()
+
+    assert response.status_code == 400
+    assert "localité et une culture disponibles" in payload["error"]
+    assert payload["confidence"] == "Faible"
+
+
+def test_soil_route_handles_api_error(monkeypatch):
+    client = app_module.app.test_client()
+    monkeypatch.setattr(
+        app_module,
+        "build_soil_context",
+        lambda location, crop: (_ for _ in ()).throw(app_module.SoilError("offline")),
+    )
+
+    response = client.get("/soil?location=bobo&crop=sorgho")
+    payload = response.get_json()
+
+    assert response.status_code == 502
+    assert "contexte sol" in payload["error"]
+    assert payload["confidence"] == "Faible"
+
+
+def test_ask_rejects_oversized_question(monkeypatch):
+    client = app_module.app.test_client()
+    monkeypatch.setattr(app_module, "MAX_QUESTION_CHARS", 20)
+    monkeypatch.setattr(app_module, "get_rag_chain", lambda: None)
+
+    response = client.post(
+        "/ask",
+        data={"messageText": "a" * 25},
+    )
+    payload = response.get_json()
+
+    assert response.status_code == 400
+    assert "trop longue" in payload["answer"].lower()
+    assert payload["confidence"] == "Faible"
+
+
+def test_ask_requires_message_text():
+    client = app_module.app.test_client()
+    response = client.post("/ask", data={})
+    payload = response.get_json()
+    assert response.status_code == 400
+    assert "question agricole" in payload["answer"]
+    assert payload["confidence"] == "Faible"
+
+
+def test_identity_answer_is_static_and_french():
+    client = app_module.app.test_client()
+    response = client.post("/ask", data={"messageText": "qui es-tu ?"})
+    payload = response.get_json()
+    assert response.status_code == 200
+    assert "Je suis DakiKobo" in payload["answer"]
+    assert payload["sources"] == []
+    assert payload["confidence"] == "Fort"
+
+
+def test_ask_rate_limit_returns_french_error(monkeypatch):
+    client = app_module.app.test_client()
+    monkeypatch.setattr(app_module, "REQUEST_COOLDOWN_SECONDS", 10)
+
+    first = client.post("/ask", data={"messageText": "qui es-tu ?"})
+    second = client.post("/ask", data={"messageText": "qui es-tu ?"})
+    payload = second.get_json()
+
+    assert first.status_code == 200
+    assert second.status_code == 429
+    assert "Veuillez patienter" in payload["error"]
+    assert payload["retry_after"] > 0
+    assert payload["confidence"] == "Faible"
+
+
+def test_fertilizer_route_uses_tool_not_rag(monkeypatch):
+    client = app_module.app.test_client()
+    monkeypatch.setattr(app_module, "get_rag_chain", lambda: None)
+    monkeypatch.setattr(
+        app_module,
+        "text_to_speech_to_static",
+        lambda text: "/static/audio/fertilizer.mp3",
+    )
+
+    response = client.post(
+        "/ask", data={"messageText": "dose d'engrais pour le sorgho"}
+    )
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert "temporairement retirées" in payload["answer"]
+    assert payload["sources"] == []
+    assert payload["confidence"] == "Faible"
+    assert payload["audio_url"] == "/static/audio/fertilizer.mp3"
+    assert payload["answer_kind"] == "refusal"
+    assert "case" not in payload
+
+
+def test_fertilizer_route_uses_form_crop_when_text_omits_crop(monkeypatch):
+    client = app_module.app.test_client()
+    monkeypatch.setattr(app_module, "get_rag_chain", lambda: None)
+    monkeypatch.setattr(app_module, "text_to_speech_to_static", lambda text: "")
+
+    response = client.post(
+        "/ask",
+        data={
+            "messageText": "quelle dose d'engrais utiliser ?",
+            "crop": "mil",
+            "growth_stage": "croissance végétative",
+            "location": "Dori",
+        },
+    )
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert "dose exacte" in payload["answer"]
+    assert payload["confidence"] == "Faible"
+    assert "case" not in payload
+
+
+def test_ask_enriches_case_with_weather_when_location_known(monkeypatch):
+    client = app_module.app.test_client()
+    monkeypatch.setattr(app_module, "get_rag_chain", lambda: None)
+    monkeypatch.setattr(app_module, "text_to_speech_to_static", lambda text: "")
+    monkeypatch.setattr(
+        app_module,
+        "build_weather_context",
+        lambda location_id: {
+            "location": {"id": location_id, "name": "Kaya"},
+            "insights": [
+                {
+                    "label": "Pluie utile (7 jours)",
+                    "status": "watch",
+                    "text": "12.0 mm récents : surveillez l'humidité.",
+                }
+            ],
+            "sources": [{"title": "Open-Meteo", "type": "Météo", "snippet": "x"}],
+        },
+    )
+
+    response = client.post(
+        "/ask",
+        data={
+            "messageText": "dose d'engrais pour le sorgho",
+            "location": "Kaya",
+        },
+    )
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["weather"]["insights"]
+    assert "case" not in payload
+    assert "Pluie utile" in payload["weather"]["insights"][0]["label"]
+    assert payload["weather"]["location"]["id"] == "kaya"
+
+
+def test_rag_route_returns_unique_sources(monkeypatch):
+    client = app_module.app.test_client()
+    _install_rag(monkeypatch, _FakeRagChain())
+    monkeypatch.setattr(
+        app_module,
+        "text_to_speech_to_static",
+        lambda text: "/static/audio/rag.mp3",
+    )
+
+    response = client.post("/ask", data={"messageText": "Quand semer le mil ?"})
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert "saison des pluies" in payload["answer"]
+    assert payload["sources"] == [
+        {
+            "title": "guide_mil.pdf",
+            "type": "Base locale",
+            "snippet": "Semez le mil au début de la saison des pluies.",
+        },
+        {
+            "title": "calendrier.pdf",
+            "type": "Base locale",
+            "snippet": "Calendrier de semis du mil au Burkina Faso.",
+        },
+    ]
+    assert payload["confidence"] == "Fort"
+    assert payload["audio_url"] == "/static/audio/rag.mp3"
+    assert payload["case"]["input_type"] == "text"
+    assert payload["case"]["case_title"] == "Conseil agricole"
+    assert payload["case"]["summary"]
+    assert payload["case"]["needs_human_confirmation"] is True
+
+
+def test_rag_ledger_links_to_feedback_in_two_steps(tmp_path, monkeypatch):
+    case_log = tmp_path / "case_log.sqlite3"
+    monkeypatch.setattr(app_module, "CASE_LOG_DB", str(case_log))
+    _install_rag(monkeypatch, _FakeRagChain())
+    monkeypatch.setattr(app_module, "text_to_speech_to_static", lambda text: "")
+    client = app_module.app.test_client()
+
+    asked = client.post(
+        "/ask",
+        data={
+            "messageText": "Quand semer le mil ?",
+            "crop": "mil",
+            "location": "kaya",
+        },
+    )
+    payload = asked.get_json()
+    assert asked.status_code == 200
+    assert payload["journal"]["answer_path"] == "rag"
+    assert payload["journal"]["crop_id"] == "mil"
+    assert payload["journal"]["place_id"] == "kaya"
+    assert payload["journal"]["ledger_created_at"] is not None
+    assert all(row["feedback_id"] is None for row in list_evidence(str(case_log)))
+
+    feedback_data = {
+        "rating": "up", "consent": "1",
+        "question": "Quand semer le mil ?",
+        "answer": payload["answer"],
+        **payload["journal"],
+    }
+    feedback_response = client.post("/feedback", data=feedback_data)
+    feedback_id = feedback_response.get_json()["feedback_id"]
+
+    linked = list_evidence(str(case_log), feedback_id=feedback_id)
+    assert len(linked) == 3
+    assert all(row["question_hash"] != "Quand semer le mil ?" for row in linked)
+    journal_row = list_feedback_events(str(case_log))[0]
+    assert journal_row["answer_path"] == "rag"
+    assert journal_row["crop_id"] == "mil"
+    assert journal_row["place_id"] == "kaya"
+
+
+def test_evidence_write_failure_never_blocks_answer(tmp_path, monkeypatch):
+    monkeypatch.setattr(app_module, "CASE_LOG_DB", str(tmp_path / "case_log.sqlite3"))
+    _install_rag(monkeypatch, _FakeRagChain())
+    monkeypatch.setattr(app_module, "text_to_speech_to_static", lambda text: "")
+    monkeypatch.setattr(
+        app_module,
+        "record_evidence",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    response = app_module.app.test_client().post(
+        "/ask",
+        data={"messageText": "Quand semer le mil ?"},
+    )
+    assert response.status_code == 200
+    assert "saison des pluies" in response.get_json()["answer"]
+    assert response.get_json()["journal"]["ledger_created_at"] is None
+
+
+def test_rag_route_attaches_field_context_to_case(monkeypatch):
+    client = app_module.app.test_client()
+    seen = {}
+
+    class _CtxChain:
+        def invoke(self, query):
+            seen["query"] = query
+            return {
+                "result": "Semez le mil au début de la saison des pluies.",
+                "source_documents": [
+                    SimpleNamespace(metadata={"source": "guide_mil.pdf"}),
+                ],
+            }
+
+    _install_rag(monkeypatch, _CtxChain())
+    monkeypatch.setattr(app_module, "text_to_speech_to_static", lambda text: "")
+
+    response = client.post(
+        "/ask",
+        data={
+            "messageText": "Quand semer le mil ?",
+            "crop": "mil",
+            "growth_stage": "levée / jeune plant",
+            "location": "Ouahigouya",
+        },
+    )
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert "Contexte utile" in seen["query"] or "culture: mil" in seen["query"]
+    assert "culture: mil" in seen["query"]
+    assert payload["case"]["crop"] == "mil"
+    assert payload["case"]["growth_stage"] == "levée / jeune plant"
+    assert payload["case"]["location"] == "Ouahigouya"
+
+
+def test_rag_route_marks_single_source_as_medium_confidence(monkeypatch):
+    client = app_module.app.test_client()
+    _install_rag(
+        monkeypatch,
+        _SingleSourceRagChain(),
+        scores={"guide_mil.pdf": 0.3},
+    )
+    monkeypatch.setattr(
+        app_module,
+        "text_to_speech_to_static",
+        lambda text: "/static/audio/rag.mp3",
+    )
+
+    response = client.post("/ask", data={"messageText": "Quand semer le mil ?"})
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["confidence"] == "Moyen"
+
+
+def test_rag_route_exposes_source_metadata(monkeypatch):
+    client = app_module.app.test_client()
+    _install_rag(monkeypatch, _MetadataSourceRagChain())
+    monkeypatch.setattr(
+        app_module,
+        "text_to_speech_to_static",
+        lambda text: "/static/audio/rag.mp3",
+    )
+
+    response = client.post(
+        "/ask",
+        data={"messageText": "Quelles données FAO existent ?"},
+    )
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["sources"] == [
+        {
+            "title": "FAO Burkina Faso - politiques agricoles",
+            "type": "Source web revue",
+            "snippet": (
+                "La FAO signale AGRISurvey, FAOSTAT et CountrySTAT "
+                "pour le Burkina Faso."
+            ),
+            "publisher": "FAO",
+            "year": "2026",
+            "country": "Burkina Faso",
+            "review_status": "Revu, validation humaine à finaliser",
+            "scope": "Cadre national d'orientation ; ne pas utiliser pour des doses.",
+            "url": "https://www.fao.org/in-action/mafap/where-we-work/burkina-faso/en",
+        }
+    ]
+    # The declared scope must survive answer construction unchanged for the UI
+    # "Portée et limites" line, without inventing zone or approval.
+    assert (
+        payload["sources"][0]["scope"]
+        == "Cadre national d'orientation ; ne pas utiliser pour des doses."
+    )
+
+
+def test_saved_journal_case_replays_source_scope(monkeypatch, tmp_path):
+    """Task A end-to-end: scope survives saving and reopening a journal case.
+
+    Obtain an answer whose source card carries a declared scope, save the case
+    through /feedback (sending the answer's sources), reopen it through /journal,
+    and assert the persisted source card still carries the exact scope. Nothing
+    is reconstructed: only the sources the answer produced are stored.
+    """
+    monkeypatch.setattr(app_module, "FEEDBACK_IMAGES", str(tmp_path / "photos"))
+    client = app_module.app.test_client()
+    _install_rag(monkeypatch, _MetadataSourceRagChain())
+    monkeypatch.setattr(
+        app_module, "text_to_speech_to_static", lambda text: ""
+    )
+
+    answered = client.post(
+        "/ask", data={"messageText": "Quelles données FAO existent ?"}
+    ).get_json()
+    sources = answered["sources"]
+    assert sources[0]["scope"] == (
+        "Cadre national d'orientation ; ne pas utiliser pour des doses."
+    )
+
+    saved = client.post("/feedback", data={
+        "rating": "up",
+        "question": "Quelles données FAO existent ?",
+        "answer": answered["answer"],
+        "consent": "1",
+        "sources": json.dumps(sources),
+    })
+    assert saved.status_code == 200
+    case_id = saved.get_json()["feedback_id"]
+
+    cases = client.get("/journal").get_json()["cases"]
+    replayed = next(case for case in cases if case["feedback_id"] == case_id)
+    assert replayed["sources"], "reopened case lost its sources"
+    assert replayed["sources"][0]["title"] == sources[0]["title"]
+    assert replayed["sources"][0]["scope"] == (
+        "Cadre national d'orientation ; ne pas utiliser pour des doses."
+    )
+
+
+def test_legacy_journal_case_without_sources_still_replays(monkeypatch, tmp_path):
+    """Backward compatibility: a case saved without sources reopens as no sources.
+
+    Old entries (pre-persistence) and rated-but-source-less answers must remain
+    readable; we never fabricate historical source cards for them.
+    """
+    monkeypatch.setattr(app_module, "FEEDBACK_IMAGES", str(tmp_path / "photos"))
+    client = app_module.app.test_client()
+
+    saved = client.post("/feedback", data={
+        "rating": "up",
+        "question": "Ancien conseil",
+        "answer": "Réponse historique.",
+        "consent": "1",
+    })
+    assert saved.status_code == 200
+    case_id = saved.get_json()["feedback_id"]
+
+    cases = client.get("/journal").get_json()["cases"]
+    replayed = next(case for case in cases if case["feedback_id"] == case_id)
+    assert replayed["answer"] == "Réponse historique."
+    assert replayed["sources"] == []
+
+
+def test_feedback_rejects_malformed_sources_with_french_message(monkeypatch, tmp_path):
+    """Malformed source cards are rejected at the boundary with French text.
+
+    A JSON list whose entries are not dict/string (e.g. `[1]`) must not leak the
+    internal English ValueError; the user sees the stable French message and no
+    case is saved.
+    """
+    monkeypatch.setattr(app_module, "FEEDBACK_IMAGES", str(tmp_path / "photos"))
+    client = app_module.app.test_client()
+
+    response = client.post("/feedback", data={
+        "rating": "up",
+        "question": "Q",
+        "answer": "A",
+        "consent": "1",
+        "sources": "[1]",
+    })
+    assert response.status_code == 400
+    payload = response.get_json()
+    assert payload["error"] == "Les sources du conseil sont invalides."
+    # No internal validation wording leaks to the client.
+    assert "each source" not in payload["error"]
+    assert "dict" not in payload["error"]
+    # Nothing was persisted for this owner.
+    assert client.get("/journal").get_json()["cases"] == []
+
+
+def test_feedback_rejects_oversized_sources_with_french_message(monkeypatch, tmp_path):
+    """An oversized source JSON payload is rejected with the French message."""
+    monkeypatch.setattr(app_module, "FEEDBACK_IMAGES", str(tmp_path / "photos"))
+    client = app_module.app.test_client()
+
+    huge = json.dumps([{"title": "x" * 30000}])
+    response = client.post("/feedback", data={
+        "rating": "up",
+        "question": "Q",
+        "answer": "A",
+        "consent": "1",
+        "sources": huge,
+    })
+    assert response.status_code == 400
+    payload = response.get_json()
+    assert payload["error"] == "Les sources du conseil sont invalides."
+    assert "too large" not in payload["error"]
+    assert client.get("/journal").get_json()["cases"] == []
+
+
+def test_feedback_accepts_valid_sources_after_validation(monkeypatch, tmp_path):
+    """Valid source cards still save and replay (no regression from validation)."""
+    monkeypatch.setattr(app_module, "FEEDBACK_IMAGES", str(tmp_path / "photos"))
+    client = app_module.app.test_client()
+
+    cards = [{"title": "Source", "type": "Base locale", "snippet": "Extrait.",
+              "scope": "Portée déclarée."}]
+    saved = client.post("/feedback", data={
+        "rating": "up",
+        "question": "Q",
+        "answer": "A",
+        "consent": "1",
+        "sources": json.dumps(cards),
+    })
+    assert saved.status_code == 200
+    case_id = saved.get_json()["feedback_id"]
+    replayed = next(
+        case for case in client.get("/journal").get_json()["cases"]
+        if case["feedback_id"] == case_id
+    )
+    assert replayed["sources"][0]["scope"] == "Portée déclarée."
+
+
+def test_rag_route_filters_and_ranks_sources_by_relevance_score(monkeypatch):
+    client = app_module.app.test_client()
+
+    scores = {
+        "IITA 2018 - Production du niebe": 0.43,
+        "Source moyenne": 0.35,
+        "Source faible": 0.18,
+    }
+    harness = _install_rag(monkeypatch, _NoisySourceRagChain(), scores=scores)
+    grounded_result = {}
+    real_grounded_answer = app_module.GroundedAnswer
+
+    def capture_grounded_answer(**kwargs):
+        grounded_result.update(kwargs)
+        return real_grounded_answer(**kwargs)
+
+    monkeypatch.setattr(app_module, "GroundedAnswer", capture_grounded_answer)
+    monkeypatch.setattr(
+        app_module,
+        "text_to_speech_to_static",
+        lambda text: "/static/audio/rag.mp3",
+    )
+
+    response = client.post(
+        "/ask",
+        data={"messageText": "Comment stocker le niébé contre les bruches ?"},
+    )
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert len(harness.search_calls) == 1
+    retrieval_query, k = harness.search_calls[0]
+    _query_starts_with(
+        retrieval_query,
+        "Comment stocker le niébé contre les bruches ?",
+    )
+    assert k == 6
+    assert [doc.metadata["source"] for doc in harness.combined_docs] == [
+        "IITA 2018 - Production du niebe",
+        "Source moyenne",
+    ]
+    assert grounded_result["retrieved_chunk_ids"] == [
+        chunk_id(doc.metadata["source"], doc.page_content)
+        for doc in harness._response["source_documents"]
+    ]
+    assert len(grounded_result["retrieved_chunk_ids"]) == 3
+    assert payload["confidence"] == "Fort"
+    titles = [source["title"] for source in payload["sources"]]
+    assert titles == ["IITA 2018 - Production du niebe"]
+    assert "Source moyenne" not in titles
+    assert "Source faible" not in titles
+
+
+def test_rag_route_refusal_has_no_sources_and_low_confidence(monkeypatch):
+    client = app_module.app.test_client()
+    _install_rag(monkeypatch, _RefusalRagChain())
+    monkeypatch.setattr(
+        app_module, "text_to_speech_to_static", lambda text: ""
+    )
+
+    response = client.post("/ask", data={"messageText": "comment cultiver le riz ?"})
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert "ne sais pas encore" in payload["answer"]
+    assert payload["sources"] == []
+    assert payload["confidence"] == "Faible"
+    assert "case" not in payload
+    assert payload.get("answer_kind") == "refusal"
+
+
+def test_rag_route_question_crop_overrides_form_crop(monkeypatch):
+    """Stale form crop=sorgho must not hijack a soja question."""
+    client = app_module.app.test_client()
+    seen = {}
+
+    class _SojaChain:
+        def invoke(self, query):
+            seen["query"] = query
+            return {
+                "result": (
+                    "Pour le soja à Mogtédo, préférez un sol bien drainé. "
+                    "Semez après une pluie utile et confirmez avec un agent."
+                ),
+                "source_documents": [
+                    SimpleNamespace(
+                        metadata={"source": "guide_legumineuses.pdf"},
+                        page_content="Le soja préfère des sols drainés au Burkina.",
+                    ),
+                ],
+            }
+
+    _install_rag(
+        monkeypatch,
+        _SojaChain(),
+        scores={"guide_legumineuses.pdf": 0.42},
+    )
+    monkeypatch.setattr(app_module, "text_to_speech_to_static", lambda text: "")
+
+    response = client.post(
+        "/ask",
+        data={
+            "messageText": "comment bien semer le soja dans la ville de Mogtedo",
+            "crop": "sorgho",
+            "growth_stage": "levée / jeune plant",
+            "location": "Ouagadougou",
+        },
+    )
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert "soja" in seen["query"].lower()
+    assert "culture: soja" in seen["query"]
+    assert "culture: sorgho" not in seen["query"]
+    assert payload["case"]["crop"] == "soja"
+    assert payload["case"]["location"] == "Mogtédo"
+    assert payload["case"]["growth_stage"] == ""
+    assert "sorgho" not in payload["answer"].lower()
+
+
+def test_rag_route_short_followup_keeps_prior_crop(monkeypatch):
+    client = app_module.app.test_client()
+    seen = {}
+
+    class _FollowChain:
+        def invoke(self, query):
+            seen["query"] = query
+            return {
+                "result": "Pour le soja à Ouagadougou, préparez le sol et attendez une pluie utile.",
+                "source_documents": [
+                    SimpleNamespace(
+                        metadata={"source": "guide_soja.pdf"},
+                        page_content="Semis du soja en zone urbaine periurbaine.",
+                    ),
+                ],
+            }
+
+    _install_rag(
+        monkeypatch,
+        _FollowChain(),
+        scores={"guide_soja.pdf": 0.4},
+    )
+    monkeypatch.setattr(app_module, "text_to_speech_to_static", lambda text: "")
+
+    response = client.post(
+        "/ask",
+        data={
+            "messageText": "ok a ouagadougou",
+            "crop": "sorgho",
+            "growth_stage": "levée / jeune plant",
+            "location": "Ouagadougou",
+            "prior_question": "comment bien semer le soja dans la ville de Mogtedo",
+        },
+    )
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert "soja" in seen["query"].lower()
+    assert "Précision" in seen["query"]
+    assert payload["case"]["crop"] == "soja"
+    assert payload["case"]["location"] == "Ouagadougou"
+    assert "plants de sorgho" not in payload["answer"].lower()
+
+
+def test_rag_route_uncertain_is_first_class_not_failure(monkeypatch):
+    client = app_module.app.test_client()
+    _install_rag(
+        monkeypatch,
+        _UncertainRagChain(),
+        scores={"guide_general.pdf": 0.4},
+    )
+    monkeypatch.setattr(app_module, "text_to_speech_to_static", lambda text: "")
+
+    response = client.post(
+        "/ask",
+        data={"messageText": "Quelle maladie exacte touche mon sorgho ?"},
+    )
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert "je ne peux pas confirmer" in payload["answer"].lower()
+    assert payload["confidence"] == "Faible"
+    assert payload["answer_kind"] == "uncertain"
+    assert payload["case"]["risk_level"] == "Non confirmé"
+    assert payload["case"]["needs_human_confirmation"] is True
+    assert payload["case"]["confirmation"]
+
+
+def test_rag_route_without_retrieved_docs_forces_refusal(monkeypatch):
+    client = app_module.app.test_client()
+    _install_rag(monkeypatch, _NoSourceRagChain())
+    monkeypatch.setattr(
+        app_module, "text_to_speech_to_static", lambda text: ""
+    )
+
+    response = client.post("/ask", data={"messageText": "Quand semer le mil ?"})
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert "Je ne sais pas encore" in payload["answer"]
+    assert payload["sources"] == []
+    assert payload["confidence"] == "Faible"
+
+
+def test_rag_route_handles_chain_errors(monkeypatch):
+    class BrokenChain:
+        def invoke(self, query):
+            raise RuntimeError("boom")
+
+    client = app_module.app.test_client()
+    _install_rag(monkeypatch, BrokenChain())
+
+    response = client.post("/ask", data={"messageText": "Quand semer le mil ?"})
+    payload = response.get_json()
+
+    # A genuine retrieval/LLM failure is reported as a service error, not as a
+    # successful answer, while the French JSON contract is preserved.
+    assert response.status_code == 503
+    assert "erreur de traitement" in payload["answer"]
+    assert payload["sources"] == []
+    assert payload["confidence"] == "Faible"
+    assert payload["audio_url"] == ""
+
+
+def test_speech_route_reports_unconfigured_service(monkeypatch):
+    client = app_module.app.test_client()
+    monkeypatch.setattr(app_module, "speech_configured", lambda: False)
+
+    response = client.post(
+        "/speech",
+        data={"audio": (__import__("io").BytesIO(b"audio"), "question.webm")},
+        content_type="multipart/form-data",
+    )
+    payload = response.get_json()
+
+    assert response.status_code == 503
+    assert "dictée vocale" in payload["error"]
+    assert payload["confidence"] == "Faible"
+
+
+def test_speech_route_requires_audio(monkeypatch):
+    client = app_module.app.test_client()
+    monkeypatch.setattr(app_module, "speech_configured", lambda: True)
+
+    response = client.post("/speech", data={})
+    payload = response.get_json()
+
+    assert response.status_code == 400
+    assert "Aucun enregistrement audio" in payload["error"]
+    assert payload["confidence"] == "Faible"
+
+
+def test_speech_route_transcribes_audio(monkeypatch):
+    client = app_module.app.test_client()
+    calls = []
+
+    monkeypatch.setattr(app_module, "speech_configured", lambda: True)
+    monkeypatch.setattr(app_module, "VOICE_COOLDOWN_SECONDS", 0)
+
+    def fake_transcribe(audio_bytes, *, filename, mime_type):
+        calls.append((audio_bytes, filename, mime_type))
+        return "Quand semer le mil ?"
+
+    monkeypatch.setattr(app_module, "transcribe_audio", fake_transcribe)
+
+    response = client.post(
+        "/speech",
+        data={
+            "audio": (
+                __import__("io").BytesIO(b"fake audio"),
+                "question.webm",
+                "audio/webm",
+            )
+        },
+        content_type="multipart/form-data",
+    )
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["text"] == "Quand semer le mil ?"
+    assert payload["confidence"] == "Moyen"
+    assert calls == [(b"fake audio", "question.webm", "audio/webm")]
+
+
+def test_speech_route_rejects_empty_audio(monkeypatch):
+    client = app_module.app.test_client()
+    monkeypatch.setattr(app_module, "speech_configured", lambda: True)
+
+    response = client.post(
+        "/speech",
+        data={"audio": (__import__("io").BytesIO(b""), "question.webm")},
+        content_type="multipart/form-data",
+    )
+    payload = response.get_json()
+
+    assert response.status_code == 400
+    assert "vide" in payload["error"]
+    assert payload["confidence"] == "Faible"
+
+
+def test_speech_route_rejects_large_audio(monkeypatch):
+    client = app_module.app.test_client()
+    monkeypatch.setattr(app_module, "speech_configured", lambda: True)
+    monkeypatch.setitem(app_module.app.config, "MAX_AUDIO_UPLOAD_BYTES", 4)
+    monkeypatch.setitem(app_module.app.config, "MAX_AUDIO_UPLOAD_MB", 0.001)
+
+    response = client.post(
+        "/speech",
+        data={"audio": (__import__("io").BytesIO(b"too large"), "question.webm")},
+        content_type="multipart/form-data",
+    )
+    payload = response.get_json()
+
+    assert response.status_code == 413
+    assert "audio est trop lourd" in payload["error"]
+    assert payload["confidence"] == "Faible"
+
+
+def test_speech_route_handles_transcription_failure(monkeypatch):
+    client = app_module.app.test_client()
+    monkeypatch.setattr(app_module, "speech_configured", lambda: True)
+    monkeypatch.setattr(app_module, "VOICE_COOLDOWN_SECONDS", 0)
+
+    def fail_transcribe(audio_bytes, *, filename, mime_type):
+        raise app_module.SpeechTranscriptionError("boom")
+
+    monkeypatch.setattr(app_module, "transcribe_audio", fail_transcribe)
+
+    response = client.post(
+        "/speech",
+        data={"audio": (__import__("io").BytesIO(b"fake audio"), "question.webm")},
+        content_type="multipart/form-data",
+    )
+    payload = response.get_json()
+
+    assert response.status_code == 502
+    assert "dictée vocale a échoué" in payload["error"]
+    assert payload["confidence"] == "Faible"
+
+
+def test_screen_reports_unconfigured_service(monkeypatch):
+    client = app_module.app.test_client()
+    monkeypatch.setattr(app_module, "disease_configured", lambda: False)
+
+    response = client.post("/screen", data={})
+    payload = response.get_json()
+
+    # An unconfigured vision service is a service state, not a screening result.
+    assert response.status_code == 503
+    assert "clé Gemini non configurée" in payload["answer"]
+    assert payload["confidence"] == "Faible"
+
+
+def test_screen_requires_image_when_configured(monkeypatch):
+    client = app_module.app.test_client()
+    monkeypatch.setattr(app_module, "disease_configured", lambda: True)
+
+    response = client.post("/screen", data={})
+    payload = response.get_json()
+
+    assert response.status_code == 400
+    assert "Aucune image" in payload["error"]
+    assert payload["confidence"] == "Faible"
+
+
+def test_screen_returns_structured_case(monkeypatch):
+    client = app_module.app.test_client()
+    monkeypatch.setattr(app_module, "disease_configured", lambda: True)
+    monkeypatch.setattr(
+        app_module,
+        "screen_leaf_image",
+        lambda image_bytes, mime_type, **context: {
+            "answer": "Observation prudente.",
+            "case": {
+                "case_id": "case_test",
+                "input_type": "image",
+                "crop": context["crop"],
+                "growth_stage": context["growth_stage"],
+                "location": context["location"],
+                "observations": ["Taches visibles."],
+                "possible_causes": ["Maladie possible."],
+                "actions": ["Surveillez la parcelle."],
+                "confidence": "Moyen",
+                "risk_level": "À vérifier",
+                "disclaimer": "Ceci n'est pas un diagnostic.",
+                "sources": [{"title": "Gemini Vision", "type": "Vision"}],
+            },
+        },
+    )
+    monkeypatch.setattr(app_module, "text_to_speech_to_static", lambda text: "")
+
+    response = client.post(
+        "/screen",
+        data={
+            "image": (__import__("io").BytesIO(b"fake"), "leaf.jpg"),
+            "crop": "maïs",
+            "growth_stage": "fructification / épi",
+            "location": "Bobo-Dioulasso",
+        },
+        content_type="multipart/form-data",
+    )
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["answer"] == "Observation prudente."
+    assert payload["case"]["case_id"] == "case_test"
+    assert payload["case"]["crop"] == "maïs"
+    assert payload["case"]["growth_stage"] == "fructification / épi"
+    assert payload["case"]["location"] == "Bobo-Dioulasso"
+    assert payload["case"]["observations"] == ["Taches visibles."]
+    assert payload["case"]["confidence"] == "Moyen"
+    assert payload["confidence"] == "Moyen"
+
+
+def test_screen_without_context_marks_confidence_low(monkeypatch):
+    client = app_module.app.test_client()
+    monkeypatch.setattr(app_module, "disease_configured", lambda: True)
+    monkeypatch.setattr(
+        app_module,
+        "screen_leaf_image",
+        lambda image_bytes, mime_type, **context: {
+            "answer": "Observation prudente.",
+            "case": {
+                "case_id": "case_test",
+                "input_type": "image",
+                "observations": ["Taches visibles."],
+                "possible_causes": ["Maladie possible."],
+                "actions": ["Surveillez la parcelle."],
+                "confidence": "Moyen",
+                "risk_level": "À vérifier",
+                "disclaimer": "Ceci n'est pas un diagnostic.",
+            },
+        },
+    )
+    monkeypatch.setattr(app_module, "text_to_speech_to_static", lambda text: "")
+
+    response = client.post(
+        "/screen",
+        data={"image": (__import__("io").BytesIO(b"fake"), "leaf.jpg")},
+        content_type="multipart/form-data",
+    )
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["case"]["confidence"] == "Faible"
+    assert payload["confidence"] == "Faible"
+
+
+def test_screen_rate_limit_returns_french_error(monkeypatch):
+    client = app_module.app.test_client()
+    monkeypatch.setattr(app_module, "disease_configured", lambda: True)
+    monkeypatch.setattr(app_module, "IMAGE_COOLDOWN_SECONDS", 10)
+    monkeypatch.setattr(
+        app_module,
+        "screen_leaf_image",
+        lambda image_bytes, mime_type, **context: {
+            "answer": "Observation prudente.",
+            "case": {
+                "case_id": "case_test",
+                "input_type": "image",
+                "observations": ["Taches visibles."],
+                "possible_causes": ["Maladie possible."],
+                "actions": ["Surveillez la parcelle."],
+                "confidence": "Moyen",
+            },
+        },
+    )
+    monkeypatch.setattr(app_module, "text_to_speech_to_static", lambda text: "")
+
+    first = client.post(
+        "/screen",
+        data={"image": (__import__("io").BytesIO(b"fake"), "leaf.jpg")},
+        content_type="multipart/form-data",
+    )
+    second = client.post(
+        "/screen",
+        data={"image": (__import__("io").BytesIO(b"fake"), "leaf.jpg")},
+        content_type="multipart/form-data",
+    )
+    payload = second.get_json()
+
+    assert first.status_code == 200
+    assert second.status_code == 429
+    assert "Veuillez patienter" in payload["error"]
+    assert payload["retry_after"] > 0
+    assert payload["confidence"] == "Faible"
+
+
+def test_screen_rejects_large_upload(monkeypatch):
+    client = app_module.app.test_client()
+    monkeypatch.setattr(app_module, "disease_configured", lambda: True)
+    monkeypatch.setitem(app_module.app.config, "MAX_CONTENT_LENGTH", 512)
+    monkeypatch.setitem(app_module.app.config, "MAX_IMAGE_UPLOAD_BYTES", 128)
+    monkeypatch.setitem(app_module.app.config, "MAX_IMAGE_UPLOAD_MB", 0.001)
+
+    response = client.post(
+        "/screen",
+        data={"image": (__import__("io").BytesIO(b"x" * 256), "leaf.jpg")},
+        content_type="multipart/form-data",
+    )
+    payload = response.get_json()
+
+    assert response.status_code == 413
+    assert "trop lourd" in payload["error"]
+    assert "Mo maximum" in payload["error"]
+    assert payload["confidence"] == "Faible"
+
+
+def test_feedback_writes_sqlite_case_log(tmp_path, monkeypatch):
+    case_log = tmp_path / "feedback" / "case_log.sqlite3"
+    monkeypatch.setattr(app_module, "CASE_LOG_DB", str(case_log))
+    client = app_module.app.test_client()
+
+    response = client.post(
+        "/feedback",
+        data={"rating": "up", "consent": "1", "question": "Q", "answer": "A"},
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["ok"] is True
+    assert payload["feedback_id"] == 1
+    rows = list_feedback_events(str(case_log))
+    assert len(rows) == 1
+    assert rows[0]["rating"] == "up"
+    assert rows[0]["question"] == "Q"
+    assert rows[0]["answer"] == "A"
+
+
+def test_feedback_validation_error_is_in_french():
+    response = app_module.app.test_client().post(
+        "/feedback",
+        data={"rating": "maybe", "question": "Q", "answer": "A"},
+    )
+
+    assert response.status_code == 400
+    assert response.get_json()["error"] == (
+        "L’évaluation doit être positive ou négative."
+    )
+
+
+def test_journal_due_route_hides_legacy_unowned_metadata(tmp_path, monkeypatch):
+    case_log = str(tmp_path / "case_log.sqlite3")
+    monkeypatch.setattr(app_module, "CASE_LOG_DB", case_log)
+    record_feedback(case_log, rating="down", question="Question privée", answer="Réponse privée", follow_up_due_at=1.0)
+    response = app_module.app.test_client().get("/journal/due")
+    assert response.status_code == 200
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.get_json()["count"] == 0
+
+
+def test_feedback_outcome_route_updates_row(tmp_path, monkeypatch):
+    case_log = tmp_path / "outcome" / "case_log.sqlite3"
+    monkeypatch.setattr(app_module, "CASE_LOG_DB", str(case_log))
+    client = app_module.app.test_client()
+
+    fb = client.post(
+        "/feedback",
+        data={"rating": "down", "consent": "1", "question": "Q", "answer": "A"},
+    )
+    feedback_id = fb.get_json()["feedback_id"]
+
+    response = client.post(
+        "/feedback/outcome",
+        data={"feedback_id": feedback_id, "outcome": "applied_improved"},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["ok"] is True
+    rows = list_feedback_events(str(case_log))
+    assert rows[0]["outcome"] == "applied_improved"
+    assert rows[0]["outcome_at"] is not None
+
+
+def test_feedback_outcome_rejects_invalid_outcome(tmp_path, monkeypatch):
+    case_log = tmp_path / "outcome" / "case_log.sqlite3"
+    monkeypatch.setattr(app_module, "CASE_LOG_DB", str(case_log))
+    client = app_module.app.test_client()
+
+    fb = client.post(
+        "/feedback",
+        data={"rating": "up", "consent": "1", "question": "Q", "answer": "A"},
+    )
+    feedback_id = fb.get_json()["feedback_id"]
+
+    response = client.post(
+        "/feedback/outcome",
+        data={"feedback_id": feedback_id, "outcome": "maybe_later"},
+    )
+
+    assert response.status_code == 400
+    assert response.get_json()["error"] == "Le résultat de suivi est invalide."
+
+
+def test_feedback_outcome_returns_404_for_missing_id(tmp_path, monkeypatch):
+    case_log = tmp_path / "outcome" / "case_log.sqlite3"
+    monkeypatch.setattr(app_module, "CASE_LOG_DB", str(case_log))
+    client = app_module.app.test_client()
+
+    response = client.post(
+        "/feedback/outcome",
+        data={"feedback_id": 9999, "outcome": "not_applied"},
+    )
+
+    assert response.status_code == 404
+    assert response.get_json()["error"] == "L’évaluation demandée est introuvable."
+
+
+
+def test_feedback_outcome_stores_after_image(tmp_path, monkeypatch):
+    case_log = tmp_path / "case_log.sqlite3"
+    img_dir = tmp_path / "feedback_images"
+    monkeypatch.setattr(app_module, "CASE_LOG_DB", str(case_log))
+    monkeypatch.setattr(app_module, "FEEDBACK_IMAGES", str(img_dir))
+    client = app_module.app.test_client()
+
+    created = client.post(
+        "/feedback",
+        data={"rating": "up", "consent": "1", "question": "Q", "answer": "A"},
+    )
+    feedback_id = created.get_json()["feedback_id"]
+
+    import io
+    from PIL import Image
+    photo = io.BytesIO()
+    Image.new("RGB", (20, 20), "green").save(photo, format="PNG")
+    photo.seek(0)
+    response = client.post(
+        "/feedback/outcome",
+        data={
+            "feedback_id": str(feedback_id),
+            "outcome": "applied_improved",
+            "after_image": (photo, "after.png"),
+        },
+        content_type="multipart/form-data",
+    )
+    payload = response.get_json()
+    assert response.status_code == 200
+    assert payload["ok"] is True
+    assert "after_image_ref" not in payload
+    rows = list_feedback_events(str(case_log))
+    assert rows[0]["after_image_ref"]
+    assert Path(rows[0]["after_image_ref"]).is_file()
+
+
+
+# =====================================================================
+# Audit regressions — findings 5, 6 and 7
+# =====================================================================
+
+class _ZeroAcceptedDocsHarness:
+    """Retrieval returns candidates, but none clears the similarity threshold."""
+
+    def __init__(self):
+        self.combine_documents_chain = self
+        self.search_calls = 0
+        self.llm_calls = 0
+
+    def similarity_search_with_relevance_scores(self, query, k):
+        self.search_calls += 1
+        return [
+            (
+                SimpleNamespace(
+                    metadata={"source": "hors_sujet.pdf"},
+                    page_content="Contenu sans rapport avec la question.",
+                ),
+                # Below app_module.SIMILARITY_THRESHOLD (0.2).
+                0.01,
+            )
+        ]
+
+    def run(self, *, input_documents, question):
+        self.llm_calls += 1
+        raise AssertionError("the LLM must not be called without grounded documents")
+
+
+def test_zero_accepted_documents_refuses_before_calling_the_llm(monkeypatch):
+    """Finding 5: an ungrounded generation was requested and then thrown away.
+
+    The old code always ran the combine chain, then overwrote its answer with
+    the refusal when no document had been accepted. That spent a Groq call and
+    briefly produced ungrounded text.
+    """
+    harness = _ZeroAcceptedDocsHarness()
+    monkeypatch.setattr(app_module, "ANSWER_CACHE_ENABLED", False)
+    monkeypatch.setattr(app_module, "get_rag_chain", lambda: harness)
+    monkeypatch.setattr(app_module, "_rag_db", harness)
+    monkeypatch.setattr(app_module, "text_to_speech_to_static", lambda text: "")
+
+    response = app_module.app.test_client().post(
+        "/ask", data={"messageText": "Quel est le cours du bitcoin ?"}
+    )
+    payload = response.get_json()
+
+    assert harness.search_calls == 1
+    assert harness.llm_calls == 0, "the LLM was called with zero accepted documents"
+    assert response.status_code == 200
+    assert "Je ne sais pas encore" in payload["answer"]
+    assert payload["sources"] == []
+    assert payload["confidence"] == "Faible"
+    assert payload["answer_kind"] == "refusal"
+
+
+def test_zero_document_refusal_is_logged_without_an_llm_call(monkeypatch, caplog):
+    harness = _ZeroAcceptedDocsHarness()
+    monkeypatch.setattr(app_module, "ANSWER_CACHE_ENABLED", False)
+    monkeypatch.setattr(app_module, "get_rag_chain", lambda: harness)
+    monkeypatch.setattr(app_module, "_rag_db", harness)
+    monkeypatch.setattr(app_module, "text_to_speech_to_static", lambda text: "")
+
+    with caplog.at_level(logging.INFO, logger="dakikobo"):
+        app_module.app.test_client().post(
+            "/ask", data={"messageText": "Question sans rapport agricole ?"}
+        )
+
+    events = [json.loads(record.message) for record in caplog.records]
+    ask_events = [e for e in events if e.get("route") == "/ask"]
+    assert ask_events
+    assert ask_events[-1]["llm_called"] is False
+    assert ask_events[-1]["refusal"] is True
+
+
+def test_greeting_is_answered_without_rag_or_an_advice_case(monkeypatch):
+    """A greeting is conversation, not agricultural evidence."""
+    monkeypatch.setattr(app_module, "ANSWER_CACHE_ENABLED", False)
+    monkeypatch.setattr(
+        app_module,
+        "get_rag_chain",
+        lambda: (_ for _ in ()).throw(AssertionError("RAG called for greeting")),
+    )
+    monkeypatch.setattr(app_module, "text_to_speech_to_static", lambda text: "")
+
+    response = app_module.app.test_client().post(
+        "/ask", data={"messageText": "hi", "simple_french": "true"}
+    )
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["answer"].startswith("Bonjour")
+    assert payload["sources"] == []
+    assert payload["answer_kind"] == "conversation"
+    assert "case" not in payload
+
+
+class _InstitutionalWeedHarness:
+    """High vector similarity with no field evidence about weeds."""
+
+    def __init__(self):
+        self.combine_documents_chain = self
+        self.llm_calls = 0
+
+    def similarity_search_with_relevance_scores(self, query, k):
+        return [
+            (
+                SimpleNamespace(
+                    metadata={
+                        "source": "MAERAH/OAPH 2026 - orientation Burkina",
+                        "doc_type": "program_doc",
+                        "crops": "arachide, mil, sorgho",
+                        "topics": "politique publique, programmes",
+                        "scope": "Orientation institutionnelle, pas un manuel de terrain.",
+                    },
+                    page_content=(
+                        "Programme agropastoral et halieutique 2023-2025. "
+                        "Structure du ministère, culture et projets publics."
+                    ),
+                ),
+                0.88,
+            )
+        ]
+
+    def run(self, *, input_documents, question):
+        self.llm_calls += 1
+        raise AssertionError("LLM called with off-topic institutional evidence")
+
+
+def test_field_practice_query_refuses_when_chunks_only_match_the_crop(monkeypatch):
+    harness = _InstitutionalWeedHarness()
+    monkeypatch.setattr(app_module, "ANSWER_CACHE_ENABLED", False)
+    monkeypatch.setattr(app_module, "get_rag_chain", lambda: harness)
+    monkeypatch.setattr(app_module, "_rag_db", harness)
+    monkeypatch.setattr(app_module, "text_to_speech_to_static", lambda text: "")
+
+    response = app_module.app.test_client().post(
+        "/ask",
+        data={
+            "messageText": (
+                "Quelles sont les herbes nuisibles à la culture de l'arachide "
+                "au Burkina ?"
+            )
+        },
+    )
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert harness.llm_calls == 0
+    assert "Je ne sais pas encore" in payload["answer"]
+    assert payload["sources"] == []
+    assert payload["confidence"] == "Faible"
+    assert payload["answer_kind"] == "refusal"
+    assert "case" not in payload
+
+
+class _UnsafeAnswerHarness:
+    """A grounded answer that names a product and a dose."""
+
+    def __init__(self, answer):
+        self.combine_documents_chain = self
+        self.answer = answer
+
+    def similarity_search_with_relevance_scores(self, query, k):
+        return [
+            (
+                SimpleNamespace(
+                    metadata={"source": "manuel_extension.pdf"},
+                    page_content="Gestion des maladies foliaires au champ.",
+                ),
+                0.4,
+            )
+        ]
+
+    def run(self, *, input_documents, question):
+        return self.answer
+
+
+def test_rag_answer_product_and_dose_are_redacted(monkeypatch):
+    """Finding 2 on the grounded path: the prompt ban was not enforced."""
+    harness = _UnsafeAnswerHarness(
+        "Surveillez la parcelle après la pluie.\n"
+        "Pulvérisez du mancozèbe à 25 g par litre d'eau.\n"
+        "Retirez les feuilles très atteintes."
+    )
+    monkeypatch.setattr(app_module, "ANSWER_CACHE_ENABLED", False)
+    monkeypatch.setattr(app_module, "get_rag_chain", lambda: harness)
+    monkeypatch.setattr(app_module, "_rag_db", harness)
+    monkeypatch.setattr(app_module, "text_to_speech_to_static", lambda text: "")
+
+    response = app_module.app.test_client().post(
+        "/ask", data={"messageText": "Comment gérer les taches sur les feuilles ?"}
+    )
+    payload = response.get_json()
+    body = json.dumps(payload, ensure_ascii=False).lower()
+
+    assert response.status_code == 200
+    assert "mancozèbe".lower() not in body
+    assert "25 g" not in body
+    assert "Surveillez la parcelle après la pluie." in payload["answer"]
+    assert "Retirez les feuilles très atteintes." in payload["answer"]
+    assert REDACTION_NOTICE in payload["answer"]
+
+
+def test_fully_unsafe_rag_answer_becomes_honest_uncertainty(monkeypatch):
+    harness = _UnsafeAnswerHarness("Traitez avec du Décis à 10 ml par litre d'eau.")
+    monkeypatch.setattr(app_module, "ANSWER_CACHE_ENABLED", False)
+    monkeypatch.setattr(app_module, "get_rag_chain", lambda: harness)
+    monkeypatch.setattr(app_module, "_rag_db", harness)
+    monkeypatch.setattr(app_module, "text_to_speech_to_static", lambda text: "")
+
+    response = app_module.app.test_client().post(
+        "/ask", data={"messageText": "Quel traitement contre les chenilles ?"}
+    )
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert "décis" not in json.dumps(payload, ensure_ascii=False).lower()
+    assert "Je ne peux pas confirmer" in payload["answer"]
+    assert payload["answer_kind"] == "uncertain"
+    assert payload["confidence"] == "Faible"
+    assert payload["case"]["risk_level"] == "Non confirmé"
+
+
+def test_rag_answer_definitive_diagnosis_is_redacted(monkeypatch):
+    """PR revision item 1: diagnosis filtering now applies to RAG answers too.
+
+    Previously the grounded path was graded for products and doses only
+    (check_diagnosis=False), so a model asserting a diagnosis reached the farmer.
+    """
+    harness = _UnsafeAnswerHarness(
+        "Observez les feuilles chaque matin.\n"
+        "Il s'agit de la rouille du mil, sans aucun doute.\n"
+        "Retirez les feuilles très atteintes et brûlez-les."
+    )
+    monkeypatch.setattr(app_module, "ANSWER_CACHE_ENABLED", False)
+    monkeypatch.setattr(app_module, "get_rag_chain", lambda: harness)
+    monkeypatch.setattr(app_module, "_rag_db", harness)
+    monkeypatch.setattr(app_module, "text_to_speech_to_static", lambda text: "")
+
+    response = app_module.app.test_client().post(
+        "/ask", data={"messageText": "Qu'est-ce que ces taches sur le mil ?"}
+    )
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    # The definitive claim is gone; the safe surrounding advice remains.
+    assert "il s'agit de la rouille" not in payload["answer"].lower()
+    assert "sans aucun doute" not in payload["answer"].lower()
+    assert "Observez les feuilles chaque matin." in payload["answer"]
+    assert "Retirez les feuilles très atteintes et brûlez-les." in payload["answer"]
+    assert REDACTION_NOTICE in payload["answer"]
+
+
+def test_rag_answer_keeps_exact_doses_out_of_the_model_path(monkeypatch):
+    """PR revision item 7: model-generated exact doses never reach the farmer.
+
+    Agronomist-approved figures are the deterministic fertilizer module's job;
+    a dose the model invents in a grounded answer is stripped.
+    """
+    harness = _UnsafeAnswerHarness(
+        "Le maïs est exigeant en azote.\n"
+        "Apportez 150 kg/ha de NPK 14-23-14 au semis puis 100 kg/ha d'urée.\n"
+        "La rotation avec le niébé aide beaucoup."
+    )
+    monkeypatch.setattr(app_module, "ANSWER_CACHE_ENABLED", False)
+    monkeypatch.setattr(app_module, "get_rag_chain", lambda: harness)
+    monkeypatch.setattr(app_module, "_rag_db", harness)
+    monkeypatch.setattr(app_module, "text_to_speech_to_static", lambda text: "")
+
+    response = app_module.app.test_client().post(
+        "/ask", data={"messageText": "Comment enrichir le sol pour le maïs ?"}
+    )
+    payload = response.get_json()
+    body = json.dumps(payload, ensure_ascii=False).lower()
+
+    assert response.status_code == 200
+    assert "150 kg/ha" not in body
+    assert "14-23-14" not in body
+    assert "100 kg/ha" not in body
+    # The safe, dose-free agronomy stays.
+    assert "La rotation avec le niébé aide beaucoup." in payload["answer"]
+    assert REDACTION_NOTICE in payload["answer"]
+
+
+def _post_ask_answer(monkeypatch, model_answer, question="Question ?"):
+    """Run the model answer through /ask and return the payload."""
+    harness = _UnsafeAnswerHarness(model_answer)
+    monkeypatch.setattr(app_module, "ANSWER_CACHE_ENABLED", False)
+    monkeypatch.setattr(app_module, "get_rag_chain", lambda: harness)
+    monkeypatch.setattr(app_module, "_rag_db", harness)
+    monkeypatch.setattr(app_module, "text_to_speech_to_static", lambda text: "")
+    response = app_module.app.test_client().post("/ask", data={"messageText": question})
+    return response, response.get_json()
+
+
+def test_ask_blocks_cross_sentence_dose(monkeypatch):
+    """PR review round 2, item 1: a dose split across sentences must be blocked."""
+    response, payload = _post_ask_answer(
+        monkeypatch,
+        "Observez le sol régulièrement.\n"
+        "L'urée convient. Appliquez 100 kg/ha.\n"
+        "La rotation aide beaucoup.",
+        question="Comment nourrir le maïs ?",
+    )
+    body = json.dumps(payload, ensure_ascii=False).lower()
+
+    assert response.status_code == 200
+    assert "100 kg/ha" not in body
+    assert "kg/ha" not in body
+    assert "La rotation aide beaucoup." in payload["answer"]
+    assert REDACTION_NOTICE in payload["answer"]
+
+
+@pytest.mark.parametrize(
+    "diagnosis",
+    [
+        "La cause est la rouille du mil.",
+        "Ces signes confirment une rouille du mil.",
+    ],
+)
+def test_ask_blocks_firm_diagnosis_forms(monkeypatch, diagnosis):
+    """PR review round 2, item 2, exercised through the /ask route."""
+    response, payload = _post_ask_answer(
+        monkeypatch,
+        f"Observez les feuilles chaque matin.\n{diagnosis}\nSurveillez la parcelle.",
+        question="Qu'est-ce que ces taches ?",
+    )
+
+    assert response.status_code == 200
+    assert diagnosis.lower() not in payload["answer"].lower()
+    assert "Observez les feuilles chaque matin." in payload["answer"]
+    assert "Surveillez la parcelle." in payload["answer"]
+    assert REDACTION_NOTICE in payload["answer"]
+
+
+@pytest.mark.parametrize(
+    "diagnosis",
+    [
+        "Votre maïs est atteint de la rouille.",
+        "La rouille est confirmée.",
+    ],
+)
+def test_ask_blocks_reviewed_passive_diagnoses(monkeypatch, diagnosis):
+    response, payload = _post_ask_answer(
+        monkeypatch,
+        f"Observez les feuilles.\n{diagnosis}\nSurveillez la parcelle.",
+        question="Que montrent ces taches ?",
+    )
+    assert response.status_code == 200
+    assert diagnosis not in payload["answer"]
+    assert REDACTION_NOTICE in payload["answer"]
+
+
+@pytest.mark.parametrize(
+    "diagnosis",
+    [
+        "Le maïs est infecté par la rouille.",
+        "Les feuilles sont contaminées par le mildiou.",
+    ],
+)
+def test_ask_blocks_passive_infection_and_contamination(monkeypatch, diagnosis):
+    response, payload = _post_ask_answer(
+        monkeypatch,
+        f"Observez les feuilles.\n{diagnosis}\nSurveillez la parcelle.",
+        question="Que montrent ces taches ?",
+    )
+    assert response.status_code == 200
+    assert diagnosis not in payload["answer"]
+    assert REDACTION_NOTICE in payload["answer"]
+
+
+def test_ask_removes_new_adversarial_instructions_before_json_and_speech(monkeypatch):
+    model_answer = (
+        "Utilisez de l’imidaclopride. "
+        "Appliquez de l’atrazine. "
+        "Fertilisez avec deux sacs d’urée par hectare. "
+        "Le maïs présente la rouille. "
+        "Observez les feuilles chaque matin."
+    )
+    harness = _UnsafeAnswerHarness(model_answer)
+    spoken = []
+    monkeypatch.setattr(app_module, "ANSWER_CACHE_ENABLED", False)
+    monkeypatch.setattr(app_module, "get_rag_chain", lambda: harness)
+    monkeypatch.setattr(app_module, "_rag_db", harness)
+    monkeypatch.setattr(
+        app_module, "text_to_speech_to_static", lambda text: spoken.append(text) or ""
+    )
+
+    response = app_module.app.test_client().post(
+        "/ask", data={"messageText": "Que faut-il appliquer au champ ?"}
+    )
+    payload = response.get_json()
+    forbidden = ("imidaclopride", "atrazine", "par hectare", "présente la rouille")
+
+    assert response.status_code == 200
+    assert spoken == [payload["answer"]]
+    assert "Observez les feuilles chaque matin." in payload["answer"]
+    assert REDACTION_NOTICE in payload["answer"]
+    for phrase in forbidden:
+        assert phrase not in payload["answer"].lower()
+        assert phrase not in spoken[0].lower()
+
+
+@pytest.mark.parametrize(
+    "sentence",
+    [
+        "Il s'agit du programme OAPH.",
+        "Il s'agit d'une technique de conservation de l'eau.",
+        "C'est certainement le bon moment pour semer.",
+        "Il s'agit peut-être d'une méthode utile.",
+    ],
+)
+def test_ask_keeps_confident_non_diagnosis_statements(monkeypatch, sentence):
+    """PR review round 2, item 3: confident non-agronomic statements pass through."""
+    response, payload = _post_ask_answer(
+        monkeypatch, sentence, question="Parlez-moi de cette pratique."
+    )
+
+    assert response.status_code == 200
+    assert sentence in payload["answer"]
+    assert REDACTION_NOTICE not in payload["answer"]
+
+
+@pytest.mark.parametrize(
+    "diagnosis",
+    [
+        "Il s'agit de l'ergot du mil.",
+        "Il s'agit de la striure du maïs.",
+        "La cause est l'helminthosporiose.",
+    ],
+)
+def test_ask_blocks_lexicon_independent_diagnosis(monkeypatch, diagnosis):
+    """PR review round 3, item 1, exercised through /ask.
+
+    The disease name is in no lexicon, but the firm-assertion frame naming a
+    plant-health subject is still redacted.
+    """
+    response, payload = _post_ask_answer(
+        monkeypatch,
+        f"Observez les feuilles chaque matin.\n{diagnosis}\nSurveillez la parcelle.",
+        question="Qu'est-ce que ces taches ?",
+    )
+
+    assert response.status_code == 200
+    assert diagnosis.lower() not in payload["answer"].lower()
+    assert "Observez les feuilles chaque matin." in payload["answer"]
+    assert "Surveillez la parcelle." in payload["answer"]
+    assert REDACTION_NOTICE in payload["answer"]
+
+
+def test_ask_keeps_exact_hedged_rouille_sentence(monkeypatch):
+    """PR review round 3, item 4: the exact hedged sentence must pass through."""
+    sentence = "Il s'agit peut-être de la rouille."
+    response, payload = _post_ask_answer(
+        monkeypatch,
+        f"Observez les feuilles. {sentence} Montrez la plante à un agent agricole.",
+        question="Que sont ces taches ?",
+    )
+
+    assert response.status_code == 200
+    assert sentence in payload["answer"]
+    assert REDACTION_NOTICE not in payload["answer"]
+
+
+def test_ask_blocks_dose_split_across_several_sentences(monkeypatch):
+    """PR review round 3, item 2: chemical noun two sentences from the quantity."""
+    response, payload = _post_ask_answer(
+        monkeypatch,
+        "L'urée convient. Vérifiez l'humidité du sol. Appliquez 100 kg/ha.",
+        question="Comment nourrir le maïs ?",
+    )
+    body = json.dumps(payload, ensure_ascii=False).lower()
+
+    assert response.status_code == 200
+    assert "100 kg/ha" not in body
+    assert "Vérifiez l'humidité du sol." in payload["answer"]
+    assert REDACTION_NOTICE in payload["answer"]
+
+
+def test_ask_preserves_irrigation_quantity_next_to_chemical_mention(monkeypatch):
+    """PR review round 3, item 2: irrigation quantity must survive."""
+    response, payload = _post_ask_answer(
+        monkeypatch,
+        "L'urée est disponible en ville. Arrosez avec 20 litres d'eau par pied.",
+        question="Comment arroser le maïs ?",
+    )
+
+    assert response.status_code == 200
+    assert "20 litres d'eau par pied" in payload["answer"]
+    assert REDACTION_NOTICE not in payload["answer"]
+
+
+@pytest.mark.parametrize(
+    "quantity",
+    [
+        "Semez 20 kg/ha.",
+        "Arrosez avec 20 litres par pied.",
+    ],
+)
+def test_ask_preserves_reviewed_seed_and_irrigation_rates(monkeypatch, quantity):
+    response, payload = _post_ask_answer(
+        monkeypatch,
+        f"L'urée est disponible en ville. {quantity}",
+        question="Comment conduire la parcelle ?",
+    )
+    assert response.status_code == 200
+    assert quantity in payload["answer"]
+    assert REDACTION_NOTICE not in payload["answer"]
+
+
+def test_screen_route_blocks_split_dose_and_negated_referral(monkeypatch):
+    vision_payload = {
+        "observations": ["Le mancozèbe semble indiqué."],
+        "problemes_possibles": ["Stress nutritif possible."],
+        "actions_immediates": ["Appliquez cent kilogrammes par hectare."],
+        "niveau_de_confiance": "Moyen",
+        "a_confirmer_par": "Vous n'avez pas besoin de consulter un agent agricole.",
+        "reponse_courte": "Surveillez la parcelle.",
+    }
+    monkeypatch.setattr(app_module, "disease_configured", lambda: True)
+    monkeypatch.setattr(app_module, "IMAGE_COOLDOWN_SECONDS", 0)
+    monkeypatch.setattr(app_module, "screen_leaf_image", disease.screen_leaf_image)
+    monkeypatch.setattr(disease, "GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(
+        disease.requests,
+        "post",
+        lambda *args, **kwargs: SimpleNamespace(
+            status_code=200,
+            json=lambda: {
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {
+                                    "text": json.dumps(
+                                        vision_payload, ensure_ascii=False
+                                    )
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+        ),
+    )
+    response = app_module.app.test_client().post(
+        "/screen",
+        data={"image": (__import__("io").BytesIO(b"fake"), "leaf.jpg")},
+    )
+    payload = response.get_json()
+    body = json.dumps(payload, ensure_ascii=False)
+    assert response.status_code == 200
+    assert "cent kilogrammes" not in body
+    assert payload["case"]["confirmation"] == disease.CONFIRMATION_FALLBACK
+
+
+def _screen_client(monkeypatch, service_status, answer="Analyse indisponible."):
+    monkeypatch.setattr(app_module, "disease_configured", lambda: True)
+    monkeypatch.setattr(app_module, "IMAGE_COOLDOWN_SECONDS", 0)
+    monkeypatch.setattr(app_module, "text_to_speech_to_static", lambda text: "")
+    monkeypatch.setattr(
+        app_module,
+        "screen_leaf_image",
+        lambda image_bytes, mime_type, **context: {
+            "answer": answer,
+            "service_status": service_status,
+            "case": {
+                "case_id": "case_test",
+                "input_type": "image",
+                "confidence": "Faible",
+                "risk_level": "Indisponible",
+            },
+        },
+    )
+    return app_module.app.test_client()
+
+
+@pytest.mark.parametrize(
+    "service_status,expected_status",
+    [
+        ("unreachable", 502),
+        ("upstream_error", 502),
+        ("unreadable_response", 502),
+        ("rate_limited", 429),
+        ("not_configured", 503),
+    ],
+)
+def test_screen_reports_genuine_vision_failures_with_non_2xx(
+    monkeypatch, service_status, expected_status
+):
+    """Finding 6: every vision failure used to be dressed up as HTTP 200."""
+    client = _screen_client(monkeypatch, service_status)
+
+    response = client.post(
+        "/screen",
+        data={"image": (__import__("io").BytesIO(b"fake"), "leaf.jpg")},
+        content_type="multipart/form-data",
+    )
+    payload = response.get_json()
+
+    assert response.status_code == expected_status
+    # The French JSON contract is unchanged, only the status differs.
+    assert set(payload) >= {
+        "answer",
+        "case",
+        "sources",
+        "confidence",
+        "audio_url",
+        "simple_french",
+        "journal",
+    }
+    assert payload["confidence"] == "Faible"
+    assert payload["sources"] == []
+    assert isinstance(payload["answer"], str) and payload["answer"]
+
+
+def test_screen_unusable_photo_is_still_a_successful_screening(monkeypatch):
+    """An unclear photo is a valid outcome and must stay 200."""
+    client = _screen_client(monkeypatch, "ok", answer="Photo floue, reprenez-la.")
+
+    response = client.post(
+        "/screen",
+        data={"image": (__import__("io").BytesIO(b"fake"), "leaf.jpg")},
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 200
+
+
+def test_screen_vision_confidence_never_reaches_fort(monkeypatch):
+    """Finding 1: a model-reported 'Fort' used to reach the farmer verbatim."""
+    monkeypatch.setattr(app_module, "disease_configured", lambda: True)
+    monkeypatch.setattr(app_module, "IMAGE_COOLDOWN_SECONDS", 0)
+    monkeypatch.setattr(app_module, "text_to_speech_to_static", lambda text: "")
+    monkeypatch.setattr(
+        app_module,
+        "screen_leaf_image",
+        lambda image_bytes, mime_type, **context: {
+            "answer": "Observation prudente.",
+            "service_status": "ok",
+            "case": {"case_id": "c", "input_type": "image", "confidence": "Fort"},
+        },
+    )
+
+    response = app_module.app.test_client().post(
+        "/screen",
+        data={
+            "image": (__import__("io").BytesIO(b"fake"), "leaf.jpg"),
+            "crop": "maïs",
+        },
+        content_type="multipart/form-data",
+    )
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["confidence"] == "Moyen"
+    assert payload["case"]["confidence"] == "Moyen"
+
+
+def test_multipart_ceiling_leaves_room_above_the_advertised_file_limit():
+    """Finding 7: the transport ceiling must exceed the per-file limit.
+
+    They used to be equal, so a file exactly at the documented size was rejected
+    once boundary markers, part headers, and the field-context values were added.
+    """
+    file_limit = app_module.app.config["MAX_IMAGE_UPLOAD_BYTES"]
+    audio_limit = app_module.app.config["MAX_AUDIO_UPLOAD_BYTES"]
+    ceiling = app_module.app.config["MAX_CONTENT_LENGTH"]
+
+    assert ceiling > max(file_limit, audio_limit)
+    assert ceiling == max(file_limit, audio_limit) + app_module.MULTIPART_OVERHEAD_BYTES
+
+
+def test_image_at_the_advertised_limit_is_accepted_despite_multipart_overhead(
+    monkeypatch,
+):
+    file_limit = 4096
+    monkeypatch.setitem(app_module.app.config, "MAX_IMAGE_UPLOAD_BYTES", file_limit)
+    monkeypatch.setitem(app_module.app.config, "MAX_IMAGE_UPLOAD_MB", 0.004)
+    monkeypatch.setitem(
+        app_module.app.config,
+        "MAX_CONTENT_LENGTH",
+        file_limit + app_module.MULTIPART_OVERHEAD_BYTES,
+    )
+    monkeypatch.setattr(app_module, "disease_configured", lambda: True)
+    monkeypatch.setattr(app_module, "IMAGE_COOLDOWN_SECONDS", 0)
+    monkeypatch.setattr(app_module, "text_to_speech_to_static", lambda text: "")
+    monkeypatch.setattr(
+        app_module,
+        "screen_leaf_image",
+        lambda image_bytes, mime_type, **context: {
+            "answer": "Observation prudente.",
+            "service_status": "ok",
+            "case": {"case_id": "c", "input_type": "image", "confidence": "Moyen"},
+        },
+    )
+
+    response = app_module.app.test_client().post(
+        "/screen",
+        data={
+            # Exactly at the advertised per-file limit.
+            "image": (__import__("io").BytesIO(b"x" * file_limit), "leaf.jpg"),
+            # Real requests also carry the field-context values.
+            "crop": "maïs",
+            "growth_stage": "fructification / épi",
+            "location": "Bobo-Dioulasso",
+            "simple_french": "1",
+        },
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 200, (
+        "a file within the documented limit was rejected because of multipart "
+        "overhead"
+    )
+    assert response.get_json()["answer"]
+
+
+def test_image_above_the_advertised_limit_is_still_rejected(monkeypatch):
+    file_limit = 4096
+    monkeypatch.setitem(app_module.app.config, "MAX_IMAGE_UPLOAD_BYTES", file_limit)
+    monkeypatch.setitem(app_module.app.config, "MAX_IMAGE_UPLOAD_MB", 0.004)
+    monkeypatch.setitem(
+        app_module.app.config,
+        "MAX_CONTENT_LENGTH",
+        file_limit + app_module.MULTIPART_OVERHEAD_BYTES,
+    )
+    monkeypatch.setattr(app_module, "disease_configured", lambda: True)
+
+    response = app_module.app.test_client().post(
+        "/screen",
+        data={"image": (__import__("io").BytesIO(b"x" * (file_limit + 1)), "leaf.jpg")},
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 413
+    assert "trop lourd" in response.get_json()["error"]
+
+
+def test_ask_response_carries_the_safety_revision_for_browser_cache_identity(
+    monkeypatch,
+):
+    """Finding 3: the browser had no way to retire answers on a safety deploy."""
+    _install_rag(monkeypatch, _FakeRagChain())
+    monkeypatch.setattr(app_module, "text_to_speech_to_static", lambda text: "")
+
+    response = app_module.app.test_client().post(
+        "/ask", data={"messageText": "Quand semer le mil ?"}
+    )
+
+    assert response.headers["X-DakiKobo-Safety"] == app_module.safety_policy_revision()
+    assert response.headers["X-DakiKobo-Safety"]
+
+
+def test_service_worker_identity_changes_with_the_safety_revision(monkeypatch):
+    client = app_module.app.test_client()
+    baseline = client.get("/sw.js").get_data(as_text=True)
+
+    monkeypatch.setattr(
+        app_module, "safety_policy_revision", lambda: "safety-different.deadbeef"
+    )
+    changed = client.get("/sw.js").get_data(as_text=True)
+
+    assert baseline != changed, (
+        "a code-only safety deployment left the service worker, and therefore "
+        "its saved answers, on the previous cache identity"
+    )
+
+
+
+# ---------------------------------------------------------------------------
+# PR review round 4 — structural diagnosis, quantity, and demo metadata gates
+# ---------------------------------------------------------------------------
+
+class _SafetyAnswerRagChain:
+    """Return one model answer so route tests exercise the production filter."""
+
+    def __init__(self, answer):
+        self.answer = answer
+
+    def invoke(self, query):
+        return {
+            "result": self.answer,
+            "source_documents": [
+                SimpleNamespace(
+                    metadata={"source": "guide_securite.pdf"},
+                    page_content="Conseils agricoles généraux à confirmer au champ.",
+                )
+            ],
+        }
+
+
+def _ask_with_model_answer(monkeypatch, answer):
+    _install_rag(monkeypatch, _SafetyAnswerRagChain(answer))
+    monkeypatch.setattr(app_module, "text_to_speech_to_static", lambda text: "")
+    response = app_module.app.test_client().post(
+        "/ask", data={"messageText": "Que faut-il vérifier au champ ?"}
+    )
+    assert response.status_code == 200
+    return response.get_json()["answer"]
+
+
+@pytest.mark.parametrize(
+    "diagnosis",
+    [
+        "Il s'agit du feu bactérien.",
+        "La cause est le flétrissement bactérien.",
+        "C'est le botrytis.",
+        "Ce sont des pucerons.",
+        "La cause est l'helminthosporiose de la plante.",
+        "C'est peut-être la rouille mais c'est le botrytis.",
+        "Il s’agit du botrytis.",
+    ],
+)
+def test_ask_blocks_unhedged_firm_diagnoses_without_a_lexicon(
+    monkeypatch, diagnosis
+):
+    answer = _ask_with_model_answer(monkeypatch, diagnosis)
+    assert diagnosis not in answer
+
+
+@pytest.mark.parametrize(
+    "safe_answer",
+    [
+        "C'est peut-être la rouille.",
+        "C'est probablement le mildiou.",
+        "Le test ne confirme pas la rouille.",
+        "Il s'agit d'une variété résistante à la rouille.",
+        "Il s'agit du programme OAPH.",
+        "Il s'agit d'une technique de conservation de l'eau.",
+        "C'est certainement le bon moment pour semer.",
+        "Il s'agit de la rotation des cultures.",
+    ],
+)
+def test_ask_preserves_hedges_negations_and_benign_diagnosis_subjects(
+    monkeypatch, safe_answer
+):
+    assert _ask_with_model_answer(monkeypatch, safe_answer) == safe_answer
+
+
+@pytest.mark.parametrize(
+    "unsafe_answer,forbidden",
+    [
+        (
+            "L'urée convient. Appliquez 100 kg/ha pour améliorer le rendement.",
+            "100 kg/ha",
+        ),
+        ("L'urée convient. Appliquez 2 g par plant.", "2 g par plant"),
+        (
+            "L'urée convient. Appliquez 100 kg/ha et semez 20 kg de semences.",
+            "100 kg/ha",
+        ),
+        ("Appliquez 0,1 tonne/ha d'urée.", "0,1 tonne/ha"),
+        ("Apportez 50 unités d'azote par hectare.", "50 unités d'azote"),
+        ("Apportez 50 kg N/ha.", "50 kg N/ha"),
+        ("Apportez 50 kg P2O5/ha.", "50 kg P2O5/ha"),
+        ("Apportez 40 kg K2O/ha.", "40 kg K2O/ha"),
+        ("Apportez 50 unités P2O5/ha.", "50 unités P2O5/ha"),
+        (
+            "Le rendement cible est 2 t/ha et la dose d'engrais est 100 kg/ha.",
+            "100 kg/ha",
+        ),
+        (
+            "Le rendement est 2 t/ha et la quantité d'engrais est 100 kg/ha.",
+            "100 kg/ha",
+        ),
+    ],
+)
+def test_ask_blocks_each_unsafe_quantity_occurrence(
+    monkeypatch, unsafe_answer, forbidden
+):
+    answer = _ask_with_model_answer(monkeypatch, unsafe_answer)
+    assert forbidden not in answer
+
+
+def test_fertilizer_demo_declares_its_answer_path_in_the_example_layer():
+    from core.examples import get_demo_example
+
+    example = get_demo_example("fumure_sorgho")
+    assert example["answer_path"] == "fertilizer"
+
+
+def test_demo_route_consumes_answer_path_metadata_without_an_id_special_case(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        app_module,
+        "get_demo_example",
+        lambda example_id: {
+            "kind": "message",
+            "question": "Exemple synthétique",
+            "answer": "Conseil déterministe.",
+            "sources": [],
+            "confidence": "Faible",
+            "audio_url": "",
+            "answer_path": "fertilizer",
+        },
+    )
+
+    payload = app_module.app.test_client().get("/examples/autre_id").get_json()
+
+    assert payload["journal"]["answer_path"] == "fertilizer"
+    assert "answer_path" not in payload

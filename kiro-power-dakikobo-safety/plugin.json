@@ -1,0 +1,18 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "dakikobo-safety",
+  "version": "1.0.0",
+  "description": "Review agricultural RAG answers for evidence, uncertainty, and DakiKobo safety boundaries.",
+  "author": {
+    "name": "MORAWA-dev"
+  },
+  "keywords": [
+    "agricultural-rag",
+    "grounding",
+    "farmer-safety",
+    "fertilizer",
+    "dakikobo"
+  ],
+  "repository": "https://github.com/MORAWA-dev/dakikobo-kiro-university-2026",
+  "license": "MIT"
+}

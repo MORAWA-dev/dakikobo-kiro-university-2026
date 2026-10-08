@@ -1,0 +1,15 @@
+{
+  "version": "v1",
+  "hooks": [
+    {
+      "name": "python-syntax-check",
+      "description": "Compile Python sources after a Python file is saved by the agent.",
+      "trigger": "PostFileSave",
+      "matcher": "\\.py$",
+      "action": {
+        "type": "command",
+        "command": "python -m compileall -q app.py core tests"
+      }
+    }
+  ]
+}

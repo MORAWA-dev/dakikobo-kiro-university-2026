@@ -1,0 +1,190 @@
+# config.py — Central configuration for DakiKobo
+# All tuneable values live here. Secret keys are loaded from environment variables.
+
+import os
+
+# The web process intentionally never loads a .env file. Production secrets must
+# be injected by the hosting platform; local developers can export variables in
+# their shell before starting Flask. This also prevents a misplaced webroot
+# .env file from silently becoming part of the application's secret store.
+APP_ENV = os.getenv("APP_ENV", "development").strip().lower()
+IS_PRODUCTION = APP_ENV == "production"
+
+# --- LLM ---
+APP_VERSION = os.getenv("APP_VERSION", "0.1.0")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_USER_AGENT = os.getenv("GROQ_USER_AGENT", "Mozilla/5.0 DakiKobo/1.0")
+# Groq decommissioned `llama-3.3-70b-versatile` on 2026-08-16. Groq's stated
+# replacement for general/reasoning workloads is `openai/gpt-oss-120b`.
+# See https://console.groq.com/docs/deprecations
+LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-oss-120b")
+# gpt-oss is a reasoning model: hidden reasoning tokens still count against the
+# completion budget, so keep more headroom than the old 512 or long French
+# answers get truncated mid-sentence. The prompt still caps answers at ~100 words.
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", 1024))
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", 0.1))
+LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "30.0"))
+LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "1"))
+# Reasoning controls, only sent for reasoning-capable Groq models.
+# "hidden" keeps chain-of-thought out of the farmer-facing answer.
+LLM_REASONING_FORMAT = os.getenv("LLM_REASONING_FORMAT", "hidden")
+# "low" keeps latency and token burn down on the free Space; gpt-oss defaults to
+# "medium". Set to "none" for qwen3 models to disable reasoning entirely.
+LLM_REASONING_EFFORT = os.getenv("LLM_REASONING_EFFORT", "low")
+
+# --- Gemini Vision (leaf disease screening) ---
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_TIMEOUT_SECONDS = float(os.getenv("GEMINI_TIMEOUT_SECONDS", "45.0"))
+
+# --- Embeddings & Vector Store ---
+# Multilingual model — much better for French queries/corpus than all-MiniLM
+# (English) while staying light/fast enough to embed on CPU.
+# NOTE: changing this model changes the vector dimension; rebuild the store
+# (delete chroma_db/ or run with REBUILD_VECTORSTORE=true).
+EMBEDDING_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
+SIMILARITY_THRESHOLD = 0.2  # on-topic FR queries score ~0.3-0.4, off-topic <=0.0 (measured)
+
+# Confidence + citation filtering, driven by retrieval relevance score (not count).
+# On-topic FR queries measure ~0.3-0.4; the retriever already drops anything below
+# SIMILARITY_THRESHOLD, so a returned source is at least "Moyen".
+CONFIDENCE_STRONG_SCORE = float(os.getenv("CONFIDENCE_STRONG_SCORE", 0.35))
+CONFIDENCE_MEDIUM_SCORE = float(os.getenv("CONFIDENCE_MEDIUM_SCORE", 0.2))
+# A secondary citation is dropped when it scores this far below the best source,
+# which suppresses unrelated cards next to the correct one.
+# Live HF eval 2026-07-10: margin 0.12 worked; keep default, allow env override.
+# Weak-title demotion is applied in ranking (see core.retrieval._source_rank_score).
+CITATION_SCORE_MARGIN = float(os.getenv("CITATION_SCORE_MARGIN", 0.12))
+MAX_RAG_SOURCES = int(os.getenv("MAX_RAG_SOURCES", "2"))
+
+CHUNK_SIZE = 500
+CHUNK_OVERLAP = 100
+
+# Persistent Chroma store: built once, then loaded on restart (folder is git-ignored).
+# Set REBUILD_VECTORSTORE=true to force a fresh rebuild (e.g. after changing the
+# embedding model or adding documents).
+VECTORSTORE_DIR = os.getenv("VECTORSTORE_DIR", "chroma_db")
+REBUILD_VECTORSTORE = os.getenv("REBUILD_VECTORSTORE", "false").lower() == "true"
+RAG_WARMUP_ON_START = os.getenv("RAG_WARMUP_ON_START", "false").lower() == "true"
+
+# --- Knowledge Base ---
+# Root folder for source documents. The reviewed Markdown conversion is preferred
+# for RAG because it is smaller and cleaner than extracting PDFs at startup. PDFs
+# remain available as a fallback when Markdown is missing or explicitly disabled.
+DATA_FOLDER = os.getenv("DATA_FOLDER", "Data")
+MARKDOWN_FOLDER = os.getenv("MARKDOWN_FOLDER", os.path.join(DATA_FOLDER, "markdown"))
+PREFER_MARKDOWN_KB = os.getenv("PREFER_MARKDOWN_KB", "true").lower() == "true"
+
+# External URLs to scrape at startup (add URLs here, uncomment to activate)
+KNOWLEDGE_URLS = [
+    # "https://www.agriculture.bf/",
+    # "https://www.fao.org/in-action/agrisurvey/access-to-data/burkina-faso/en",
+    # "https://www.fao.org/in-action/mafap/where-we-work/burkina-faso/en",
+]
+WEB_FETCH_TIMEOUT_SECONDS = float(os.getenv("WEB_FETCH_TIMEOUT_SECONDS", "15.0"))
+
+# --- Local case / feedback log ---
+# Runtime-generated SQLite database. Do not commit it.
+CASE_LOG_DB_PATH = os.getenv("CASE_LOG_DB_PATH", os.path.join("data", "case_log.sqlite3"))
+# A rated answer enters the follow-up digest after this many days.
+FOLLOW_UP_DELAY_DAYS = float(os.getenv("FOLLOW_UP_DELAY_DAYS", "7"))
+JOURNAL_RETENTION_DAYS = int(os.getenv("JOURNAL_RETENTION_DAYS", "90"))
+JOURNAL_MAX_CASES = int(os.getenv("JOURNAL_MAX_CASES", "100"))
+# Shared runtime state for TTL caches and privacy-safe ops events. SQLite WAL
+# makes this file safe to use from all Gunicorn workers.
+STATE_DB_PATH = os.getenv("STATE_DB_PATH", os.path.join("data", "runtime_state.sqlite3"))
+ANSWER_CACHE_ENABLED = os.getenv("ANSWER_CACHE_ENABLED", "true").lower() == "true"
+ANSWER_CACHE_TTL_SECONDS = int(os.getenv("ANSWER_CACHE_TTL_SECONDS", "86400"))
+# Optional before/after leaf photos linked to feedback rows (git-ignored).
+FEEDBACK_IMAGE_DIR = os.getenv(
+    "FEEDBACK_IMAGE_DIR",
+    os.path.join("data", "feedback_images"),
+)
+
+# --- Firecrawl candidate source ingestion ---
+FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY", "")
+FIRECRAWL_API_URL = os.getenv("FIRECRAWL_API_URL", "https://api.firecrawl.dev/v2/scrape")
+FIRECRAWL_HTTP_TIMEOUT_SECONDS = float(os.getenv("FIRECRAWL_HTTP_TIMEOUT_SECONDS", "45.0"))
+FIRECRAWL_SCRAPE_TIMEOUT_MS = int(os.getenv("FIRECRAWL_SCRAPE_TIMEOUT_MS", "60000"))
+FIRECRAWL_MAX_RETRIES = int(os.getenv("FIRECRAWL_MAX_RETRIES", "2"))
+FIRECRAWL_PENDING_DIR = os.getenv(
+    "FIRECRAWL_PENDING_DIR",
+    os.path.join(DATA_FOLDER, "scraped", "pending"),
+)
+FIRECRAWL_REVIEWED_DIR = os.getenv(
+    "FIRECRAWL_REVIEWED_DIR",
+    os.path.join(MARKDOWN_FOLDER, "scraped_reviewed"),
+)
+
+# --- TTS ---
+TTS_LANGUAGE = "fr"           # French — official language of Burkina Faso
+TTS_MAX_CHARS = 700           # answers run ~100 words (~600 chars); cover the full reply
+TTS_TIMEOUT_SECONDS = float(os.getenv("TTS_TIMEOUT_SECONDS", "8.0"))
+AUDIO_OUTPUT_DIR = os.path.join("static", "audio")
+# Generated MP3s are named after the answer they speak, so repeats reuse one
+# file. These bounds keep the directory from growing without limit on a
+# long-running host: files are dropped by age first, then least-recently-used
+# until the total fits. Set either to 0 to disable that half of the policy.
+TTS_CACHE_TTL_SECONDS = float(os.getenv("TTS_CACHE_TTL_SECONDS", str(24 * 60 * 60)))
+# Abandoned partial writes; active workers hold an advisory file lock.
+TTS_PARTIAL_TTL_SECONDS = float(os.getenv("TTS_PARTIAL_TTL_SECONDS", "3600"))
+TTS_CACHE_MAX_BYTES = int(os.getenv("TTS_CACHE_MAX_BYTES", str(64 * 1024 * 1024)))
+
+# --- STT ---
+STT_MODEL = os.getenv("STT_MODEL", "whisper-large-v3-turbo")
+STT_LANGUAGE = os.getenv("STT_LANGUAGE", "fr")
+STT_TIMEOUT_SECONDS = float(os.getenv("STT_TIMEOUT_SECONDS", "30.0"))
+STT_MAX_RETRIES = int(os.getenv("STT_MAX_RETRIES", "1"))
+VOICE_COOLDOWN_SECONDS = float(os.getenv("VOICE_COOLDOWN_SECONDS", "2.0"))
+MAX_AUDIO_UPLOAD_MB = float(os.getenv("MAX_AUDIO_UPLOAD_MB", "5.0"))
+MAX_AUDIO_UPLOAD_BYTES = int(MAX_AUDIO_UPLOAD_MB * 1024 * 1024)
+
+# --- External context APIs ---
+WEATHER_TIMEOUT_SECONDS = float(os.getenv("WEATHER_TIMEOUT_SECONDS", "10.0"))
+# SoilGrids can be slow/cold on free hosting; allow a bit more time by default.
+SOIL_TIMEOUT_SECONDS = float(os.getenv("SOIL_TIMEOUT_SECONDS", "18.0"))
+
+# --- Flask ---
+DEBUG = os.getenv("FLASK_DEBUG", "false").lower() == "true"
+from core.session_secret import load_session_secret
+_configured_secret = os.getenv("FLASK_SECRET_KEY", "").strip()
+if IS_PRODUCTION and DEBUG:
+    raise RuntimeError("FLASK_DEBUG must be false when APP_ENV=production")
+if IS_PRODUCTION and not _configured_secret:
+    raise RuntimeError("FLASK_SECRET_KEY must be supplied by the hosting platform")
+SECRET_KEY = load_session_secret(
+    _configured_secret,
+    os.path.dirname(STATE_DB_PATH) or ".",
+)
+# Phase 3/4 privacy contract: question hashes are salted with the existing
+# Flask secret rather than stored or hashed unsalted.
+QUESTION_HASH_SALT = SECRET_KEY
+REQUEST_COOLDOWN_SECONDS = float(os.getenv("REQUEST_COOLDOWN_SECONDS", "2.0"))
+IMAGE_COOLDOWN_SECONDS = float(os.getenv("IMAGE_COOLDOWN_SECONDS", "6.0"))
+MAX_IMAGE_UPLOAD_MB = float(os.getenv("MAX_IMAGE_UPLOAD_MB", "5.0"))
+MAX_IMAGE_UPLOAD_BYTES = int(MAX_IMAGE_UPLOAD_MB * 1024 * 1024)
+# Headroom added on top of the advertised per-file limit to form Flask's
+# whole-request ceiling (MAX_CONTENT_LENGTH). A multipart POST also carries
+# boundary markers, per-part headers, and the field-context form values, so
+# without this allowance a file exactly at the documented limit was rejected
+# with 413 even though the file itself was acceptable.
+MULTIPART_OVERHEAD_BYTES = int(os.getenv("MULTIPART_OVERHEAD_BYTES", 512 * 1024))
+# Reject oversized text questions before RAG/TTS work.
+MAX_QUESTION_CHARS = int(os.getenv("MAX_QUESTION_CHARS", "1000"))
+
+# SQLite-backed observability window (privacy-safe aggregates only).
+OPS_METRICS_MAX_EVENTS = int(os.getenv("OPS_METRICS_MAX_EVENTS", "200"))
+OPS_METRICS_ENABLED = os.getenv("OPS_METRICS_ENABLED", "true").lower() == "true"
+SEARCH_ENGINE_INDEXING_ENABLED = (
+    os.getenv("SEARCH_ENGINE_INDEXING_ENABLED", "false").lower() == "true"
+)
+
+# --- Bot Identity ---
+BOT_NAME = "DakiKobo"
+BOT_CREATOR = "a Geomatics MSc expert"
+
+# Shared resource budgets (no raw client IP retained).
+BUDGET_CLIENT_PER_MINUTE = int(os.getenv("BUDGET_CLIENT_PER_MINUTE", "60"))
+BUDGET_GLOBAL_PER_MINUTE = int(os.getenv("BUDGET_GLOBAL_PER_MINUTE", "120"))
+BUDGET_GLOBAL_PER_DAY = int(os.getenv("BUDGET_GLOBAL_PER_DAY", "2000"))

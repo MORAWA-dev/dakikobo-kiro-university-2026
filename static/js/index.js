@@ -1,0 +1,1671 @@
+$(function() {
+    var BOT_AVATAR = '/static/images/logo.png';
+    var BOT_AVATAR_ALT = 'Logo DakiKobo';
+    var api = window.DakiKoboApi;
+    var renderModule = window.DakiKoboRender.create($, api);
+    var cleanDisplayText = renderModule.cleanDisplayText;
+    var escapeHtml = renderModule.escapeHtml;
+    var renderFeedback = renderModule.renderFeedback;
+    var renderSources = renderModule.renderSources;
+    var safeSourceUrl = renderModule.safeSourceUrl;
+    var sourceMetaItems = renderModule.sourceMetaItems;
+    var typeMessage = renderModule.typeMessage;
+
+    // Note: We keep the synth/msg variables, but primarily use the <audio> element due to cross-browser issues with SpeechSynthesis.
+    var synth = window.speechSynthesis;
+    var msg = new SpeechSynthesisUtterance();
+    var voices = synth.getVoices();
+    if (voices.length > 0) {
+        // Try to select a French voice if available, though gTTS is providing the audio file.
+        msg.voice = voices.find(v => v.lang.startsWith('fr')) || voices[0]; 
+    }
+    msg.rate = 1;
+    msg.pitch = 1;
+    var currentAudio = null;
+    var credibilityLastFocus = null;
+
+    function trapDialogFocus($dialog, e) {
+        if (e.key !== 'Tab') { return; }
+        var focusable = $dialog
+            .find('a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])')
+            .filter(function() {
+                return !this.hidden && !$(this).closest('[hidden]').length;
+            })
+            .toArray();
+        if (!focusable.length) {
+            e.preventDefault();
+            return;
+        }
+        var first = focusable[0];
+        var last = focusable[focusable.length - 1];
+        if (e.shiftKey && document.activeElement === first) {
+            e.preventDefault();
+            last.focus();
+        } else if (!e.shiftKey && document.activeElement === last) {
+            e.preventDefault();
+            first.focus();
+        }
+    }
+
+    function setCredibilityOpen(open) {
+        var $modal = $('#credibilityModal');
+        var $toggle = $('#credibilityToggle');
+        $modal.prop('hidden', !open);
+        $toggle
+            .attr('aria-expanded', open ? 'true' : 'false')
+            .toggleClass('active', open);
+        if (open) {
+            credibilityLastFocus = document.activeElement;
+            $('#credibilityClose').trigger('focus');
+        } else if (credibilityLastFocus && document.contains(credibilityLastFocus)) {
+            credibilityLastFocus.focus();
+            credibilityLastFocus = null;
+        }
+    }
+
+    $('#credibilityToggle').on('click', function() {
+        setCredibilityOpen($('#credibilityModal').prop('hidden'));
+    });
+
+    $('#credibilityClose').on('click', function() {
+        setCredibilityOpen(false);
+    });
+
+    $('#credibilityModal').on('click', function(e) {
+        if (e.target === this) {
+            setCredibilityOpen(false);
+        }
+    });
+
+    $(document).on('keydown', function(e) {
+        var $credibility = $('#credibilityModal');
+        var $journal = $('#journalPanel');
+        if (!$credibility.prop('hidden')) {
+            if (e.key === 'Escape') { setCredibilityOpen(false); }
+            else { trapDialogFocus($credibility, e); }
+        } else if (!$journal.prop('hidden')) {
+            if (e.key === 'Escape') { setJournalOpen(false); }
+            else { trapDialogFocus($journal, e); }
+        }
+    });
+
+    function stopCurrentAudio() {
+        if (currentAudio) {
+            currentAudio.pause();
+            currentAudio.currentTime = 0;
+            currentAudio = null;
+        }
+        if (synth.speaking) {
+            synth.cancel();
+        }
+    }
+
+    function playAudio(audioUrl, onFailure) {
+        if (!audioUrl) {
+            return;
+        }
+        stopCurrentAudio();
+        var audio = new Audio(audioUrl);
+        currentAudio = audio;
+        function failed() {
+            if (currentAudio !== audio) { return; }
+            audio.pause();
+            currentAudio = null;
+            if (onFailure) { onFailure(); }
+        }
+        audio.addEventListener('ended', function() {
+            if (currentAudio === audio) { currentAudio = null; }
+        });
+        audio.addEventListener('error', failed);
+        audio.play().catch(failed);
+    }
+
+    function renderAudioReplay(bubble, audioUrl, text) {
+        if (!audioUrl && !(window.speechSynthesis && text)) {
+            return;
+        }
+        var $actions = $('<div class="audio-actions"></div>');
+        var $button = $('<button type="button" class="audio-replay" aria-label="Réécouter la réponse" title="Réécouter la réponse"></button>');
+        $button.append($('<i class="fas fa-volume-up" aria-hidden="true"></i>'));
+        $button.append($('<span></span>').text('Écouter / arrêter'));
+        var $status = $('<span class="audio-status" role="status"></span>');
+        $button.on('click', function() {
+            $status.text('');
+            if (currentAudio && !currentAudio.paused) { currentAudio.pause(); return; }
+            if (window.speechSynthesis && window.speechSynthesis.speaking) { stopCurrentAudio(); return; }
+            if (audioUrl) {
+                playAudio(audioUrl, function() {
+                    $status.text("L’audio est indisponible ou a expiré. Le texte reste disponible. Vérifiez votre connexion puis réessayez.");
+                });
+            }
+            else {
+                stopCurrentAudio();
+                var utterance = new SpeechSynthesisUtterance(text);
+                utterance.lang = 'fr-FR';
+                window.speechSynthesis.speak(utterance);
+            }
+        });
+        $actions.append($button, $status);
+        bubble.append($actions);
+        $('.chat-messages').scrollTop($('.chat-messages')[0].scrollHeight);
+    }
+
+    function appendMessage(message, isUser, sources, question, confidence, audioUrl, journal) {
+        var messageClass = isUser ? 'user-message' : 'bot-message';
+        // Updated logo reference to DakiKobo
+        var logoHTML = isUser ? '' : '<div class="bot-logo"><img src="' + BOT_AVATAR + '" alt="' + BOT_AVATAR_ALT + '"></div>';
+        var userImageHTML = isUser ? '<div class="user-image"><img src="/static/images/user_avatar.png" alt="User"></div>' : '';
+        var messageElement = $('<div class="message-container ' + (isUser ? 'user-container' : 'bot-container') + '">' + 
+                            logoHTML + 
+                            '<div class="message ' + messageClass + '"></div>' +
+                            userImageHTML +
+                           '</div>');
+        $('.chat-messages').append(messageElement);
+
+        if (isUser) {
+            messageElement.find('.message').text(message);
+        } else {
+            // Render source chips + feedback only once the answer has finished typing.
+            var bubble = messageElement.find('.message');
+            typeMessage(message, bubble, 15, function() {
+                renderConfidence(bubble, confidence);
+                renderSources(bubble, sources);
+                renderAudioReplay(bubble, audioUrl, message);
+                if (question) {
+                    renderFeedback(bubble, question, message, journal, sources);
+                }
+            });
+        }
+
+        $('.chat-messages').scrollTop($('.chat-messages')[0].scrollHeight);
+        return messageElement;
+    }
+
+
+    function confidenceClass(confidence) {
+        var value = (confidence || '').toString().toLowerCase();
+        if (value === 'fort') {
+            return 'confidence-fort';
+        }
+        if (value === 'faible') {
+            return 'confidence-faible';
+        }
+        return 'confidence-moyen';
+    }
+
+    function renderConfidence(bubble, confidence) {
+        if (!confidence) {
+            return;
+        }
+        var $line = $('<div class="confidence-line"></div>');
+        $line.append(
+            $('<span class="confidence-pill"></span>')
+                .addClass(confidenceClass(confidence))
+                .text('Confiance : ' + confidence)
+        );
+        bubble.append($line);
+    }
+
+
+    function asList(value) {
+        if (!value) {
+            return [];
+        }
+        if (Array.isArray(value)) {
+            return value.filter(Boolean);
+        }
+        return [value];
+    }
+
+
+    function asCleanList(value, maxItems) {
+        var max = maxItems || 3;
+        return asList(value)
+            .map(cleanDisplayText)
+            .filter(Boolean)
+            .slice(0, max);
+    }
+
+    function renderCaseSection($case, title, values, maxItems) {
+        var items = asCleanList(values, maxItems || 3);
+        if (items.length === 0) {
+            return;
+        }
+        var $section = $('<div class="case-section"></div>');
+        $section.append($('<div class="case-section-title"></div>').text(title));
+        var $list = $('<ul></ul>');
+        items.forEach(function(item) {
+            $list.append($('<li></li>').text(item));
+        });
+        $section.append($list);
+        $case.append($section);
+    }
+
+    function renderCompactSources(bubble, sources) {
+        if (!sources || sources.length === 0) {
+            return;
+        }
+        var $details = $('<details class="sources-details"></details>');
+        $details.append($('<summary class="sources-summary"></summary>').text('Sources'));
+        var $box = $('<div class="sources sources-compact"></div>');
+        sources.slice(0, 2).forEach(function(src) {
+            if (typeof src === 'string') {
+                $box.append($('<div class="source-line"></div>').text(src));
+                return;
+            }
+            var title = cleanDisplayText(src.title || '') || (src.title || 'Source');
+            var type = src.type || '';
+            var url = safeSourceUrl(src.url);
+            var $line = $('<div class="source-line"></div>');
+            if (type) {
+                $line.append($('<span class="source-type-quiet"></span>').text(type));
+            }
+            if (url) {
+                $line.append(
+                    $('<a class="source-title-link" target="_blank" rel="noopener noreferrer"></a>')
+                        .attr('href', url)
+                        .text(title)
+                );
+            } else {
+                $line.append($('<span class="source-title-quiet"></span>').text(title));
+            }
+            $box.append($line);
+        });
+        $details.append($box);
+        bubble.append($details);
+    }
+
+    function caseTitleFor(caseData) {
+        if (caseData && caseData.case_title) {
+            return caseData.case_title;
+        }
+        var inputType = caseData && caseData.input_type ? caseData.input_type : '';
+        if (inputType === 'fertilizer') {
+            return 'Conseil engrais';
+        }
+        if (inputType === 'text') {
+            return 'Conseil agricole';
+        }
+        return 'Cas de terrain - feuille';
+    }
+
+    function appendCaseMessage(caseData, fallbackAnswer, sources, confidenceOverride, audioUrl, question, journal) {
+        var logoHTML = '<div class="bot-logo"><img src="' + BOT_AVATAR + '" alt="' + BOT_AVATAR_ALT + '"></div>';
+        var messageElement = $('<div class="message-container bot-container">' +
+                            logoHTML +
+                            '<div class="message bot-message case-message"></div>' +
+                           '</div>');
+        var bubble = messageElement.find('.message');
+        var $case = $('<div class="diagnostic-case diagnostic-case-compact"></div>');
+        var confidence = confidenceOverride || (caseData && caseData.confidence ? caseData.confidence : 'Moyen');
+        var risk = caseData && caseData.risk_level ? caseData.risk_level : 'À vérifier';
+        var answerText = (caseData && caseData.answer) ? caseData.answer : (fallbackAnswer || '');
+        var isImage = caseData && caseData.input_type === 'image';
+
+        // One quiet header line: title + confidence.
+        var $head = $('<div class="case-head case-head-inline"></div>');
+        $head.append($('<div class="case-title"></div>').text(caseTitleFor(caseData)));
+        var $badges = $('<div class="case-badges"></div>');
+        $badges.append(
+            $('<span class="case-badge confidence"></span>')
+                .addClass(confidenceClass(confidence))
+                .text(confidence)
+        );
+        if (risk === 'Non confirmé') {
+            $badges.append($('<span class="case-badge uncertain"></span>').text('Incertain'));
+        }
+        $head.append($badges);
+        $case.append($head);
+
+        if (caseData) {
+            var meta = [];
+            if (caseData.crop) {
+                meta.push(caseData.crop);
+            }
+            if (caseData.growth_stage) {
+                meta.push(caseData.growth_stage);
+            }
+            if (caseData.location) {
+                meta.push(caseData.location);
+            }
+            if (meta.length) {
+                // "Sujet" = effective topic (question wins over stale form crop).
+                $case.append(
+                    $('<p class="case-meta-line"></p>').text('Sujet : ' + meta.join(' · '))
+                );
+            }
+
+            // Lead answer only — one short paragraph.
+            var mainText = cleanDisplayText(caseData.summary) ||
+                cleanDisplayText(fallbackAnswer) ||
+                cleanDisplayText(caseData.answer);
+            if (mainText) {
+                if (mainText.length > 200) {
+                    var cut = mainText.indexOf('. ');
+                    if (cut > 40 && cut < 180) {
+                        mainText = mainText.slice(0, cut + 1);
+                    }
+                }
+                $case.append($('<p class="case-lead"></p>').text(mainText));
+            }
+
+            if (isImage) {
+                renderCaseSection($case, 'Observations', caseData.observations, 2);
+                renderCaseSection($case, 'Problèmes possibles', caseData.possible_causes, 2);
+            }
+            // Text advice: actions first; optional single "Pourquoi" only if clean.
+            renderCaseSection($case, 'Ce que vous pouvez faire maintenant', caseData.actions, 3);
+            if (!isImage) {
+                renderCaseSection($case, 'Ce qu’il faut vérifier', caseData.evidence, 1);
+            }
+            renderCaseSection($case, 'À éviter', caseData.do_not, 1);
+
+            // Single quiet weather line (no heavy section).
+            var weatherLines = asCleanList(caseData.weather_signals, 1);
+            if (weatherLines.length) {
+                $case.append(
+                    $('<p class="case-weather-line"></p>').text('Météo : ' + weatherLines[0])
+                );
+            }
+            if (caseData.confirmation) {
+                $case.append(
+                    $('<p class="case-confirm"></p>').text(caseData.confirmation)
+                );
+            }
+        } else if (fallbackAnswer) {
+            $case.append($('<p class="case-lead"></p>').text(cleanDisplayText(fallbackAnswer) || fallbackAnswer));
+        }
+
+        bubble.append($case);
+        // Collapsed sources — titles only, no FEWS dumps.
+        renderCompactSources(
+            bubble,
+            caseData && caseData.sources && caseData.sources.length
+                ? caseData.sources
+                : sources
+        );
+        renderAudioReplay(bubble, audioUrl, answerText);
+        if (question) {
+            renderFeedback(bubble, question, answerText, journal,
+                caseData && caseData.sources && caseData.sources.length
+                    ? caseData.sources
+                    : sources);
+        }
+        $('.chat-messages').append(messageElement);
+        $('.chat-messages').scrollTop($('.chat-messages')[0].scrollHeight);
+        return messageElement;
+    }
+
+    function weatherStatusClass(status) {
+        if (status === 'good') {
+            return 'weather-good';
+        }
+        if (status === 'risk') {
+            return 'weather-risk';
+        }
+        return 'weather-watch';
+    }
+
+    function formatWeatherMetric(value, unit) {
+        if (value === null || value === undefined || value === '') {
+            return 'n.d.';
+        }
+        return value + unit;
+    }
+
+    function appendWeatherMessage(weather) {
+        var logoHTML = '<div class="bot-logo"><img src="' + BOT_AVATAR + '" alt="' + BOT_AVATAR_ALT + '"></div>';
+        var messageElement = $('<div class="message-container bot-container">' +
+                            logoHTML +
+                            '<div class="message bot-message weather-message"></div>' +
+                           '</div>');
+        var bubble = messageElement.find('.message');
+        var $card = $('<div class="weather-card"></div>');
+        var location = weather.location || {};
+        var metrics = weather.metrics || {};
+
+        var $head = $('<div class="weather-head"></div>');
+        $head.append($('<div class="weather-title"></div>').text('Météo agricole - ' + (location.name || 'Localité')));
+        if (weather.updated_at) {
+            $head.append($('<div class="weather-updated"></div>').text('Mise à jour : ' + weather.updated_at));
+        }
+        $card.append($head);
+
+        var $metrics = $('<div class="weather-metrics"></div>');
+        [
+            ['Pluie 7 j', formatWeatherMetric(metrics.rain_7d_mm, ' mm')],
+            ['Pluie 3 j', formatWeatherMetric(metrics.rain_next_3d_mm, ' mm')],
+            ['ET0 7 j', formatWeatherMetric(metrics.et0_7d_mm, ' mm')],
+            ['Humidité sol', metrics.soil_moisture_signal || 'n.d.']
+        ].forEach(function(item) {
+            var $metric = $('<div class="weather-metric"></div>');
+            $metric.append($('<span></span>').text(item[0]));
+            $metric.append($('<strong></strong>').text(item[1]));
+            $metrics.append($metric);
+        });
+        $card.append($metrics);
+
+        var $insights = $('<div class="weather-insights"></div>');
+        (weather.insights || []).forEach(function(insight) {
+            var $item = $('<div class="weather-insight"></div>').addClass(weatherStatusClass(insight.status));
+            $item.append($('<div class="weather-insight-label"></div>').text(insight.label || 'Signal'));
+            $item.append($('<p></p>').text(insight.text || ''));
+            $insights.append($item);
+        });
+        $card.append($insights);
+
+        if (weather.disclaimer) {
+            $card.append($('<p class="weather-disclaimer"></p>').text(weather.disclaimer));
+        }
+
+        bubble.append($card);
+        renderSources(bubble, weather.sources);
+        $('.chat-messages').append(messageElement);
+        $('.chat-messages').scrollTop($('.chat-messages')[0].scrollHeight);
+        return messageElement;
+    }
+
+    function formatSoilMetric(value, unit) {
+        if (value === null || value === undefined || value === '') {
+            return 'n.d.';
+        }
+        return value + unit;
+    }
+
+    function appendSoilMessage(soil, fertilizer, confidence) {
+        var logoHTML = '<div class="bot-logo"><img src="' + BOT_AVATAR + '" alt="' + BOT_AVATAR_ALT + '"></div>';
+        var messageElement = $('<div class="message-container bot-container">' +
+                            logoHTML +
+                            '<div class="message bot-message soil-message"></div>' +
+                           '</div>');
+        var bubble = messageElement.find('.message');
+        var $card = $('<div class="soil-card"></div>');
+        var location = soil.location || {};
+        var metrics = soil.metrics || {};
+
+        var $head = $('<div class="soil-head"></div>');
+        $head.append($('<div class="soil-title"></div>').text('Sol + engrais - ' + (location.name || 'Localité')));
+        $head.append($('<div class="soil-subtitle"></div>').text('Culture : ' + (soil.crop || 'culture') + ' · profondeur ' + (soil.depth || '0-5 cm')));
+        $card.append($head);
+
+        var $metrics = $('<div class="soil-metrics"></div>');
+        [
+            ['Argile', formatSoilMetric(metrics.clay_percent, ' %')],
+            ['Sable', formatSoilMetric(metrics.sand_percent, ' %')],
+            ['Carbone org.', formatSoilMetric(metrics.soc_percent, ' %')],
+            ['pH', formatSoilMetric(metrics.ph_h2o, '')]
+        ].forEach(function(item) {
+            var $metric = $('<div class="soil-metric"></div>');
+            $metric.append($('<span></span>').text(item[0]));
+            $metric.append($('<strong></strong>').text(item[1]));
+            $metrics.append($metric);
+        });
+        $card.append($metrics);
+
+        var $indicators = $('<div class="soil-indicators"></div>');
+        (soil.indicators || []).forEach(function(indicator) {
+            var $item = $('<div class="soil-indicator"></div>').addClass(weatherStatusClass(indicator.status));
+            $item.append($('<div class="soil-indicator-label"></div>').text(indicator.label || 'Indicateur'));
+            $item.append($('<strong></strong>').text(indicator.value || 'À vérifier'));
+            $item.append($('<p></p>').text(indicator.text || ''));
+            $indicators.append($item);
+        });
+        $card.append($indicators);
+
+        if (fertilizer && fertilizer.answer) {
+            var $fertilizer = $('<div class="soil-fertilizer"></div>');
+            $fertilizer.append($('<div class="soil-section-title"></div>').text('Fumure déterministe'));
+            $fertilizer.append($('<p></p>').text(fertilizer.answer));
+            $card.append($fertilizer);
+        }
+
+        if (soil.disclaimer) {
+            $card.append($('<p class="soil-disclaimer"></p>').text(soil.disclaimer));
+        }
+
+        bubble.append($card);
+        renderConfidence(bubble, confidence);
+        renderSources(bubble, (soil.sources || []).concat((fertilizer && fertilizer.sources) || []));
+        $('.chat-messages').append(messageElement);
+        $('.chat-messages').scrollTop($('.chat-messages')[0].scrollHeight);
+        return messageElement;
+    }
+
+
+    function showTypingIndicator() {
+        var typingIndicator = $('<div class="typing-indicator bot-message"><span></span><span></span><span></span></div>');
+        $('.chat-messages').append(typingIndicator);
+        $('.chat-messages').scrollTop($('.chat-messages')[0].scrollHeight);
+    }
+
+    function removeTypingIndicator() {
+        $('.typing-indicator').remove();
+    }
+
+    $('#chatbot-form-btn').click(function(e) {
+        e.preventDefault();
+        submitMessage();
+    });
+
+    $('.examples-panel').on('click', '.example-card', function(e) {
+        e.preventDefault();
+        if (isProcessing) {
+            return;
+        }
+        var exampleId = $(this).data('example-id');
+        var prompt = $(this).data('prompt') || $(this).find('.example-text').text();
+        loadDemoExample(exampleId, prompt);
+    });
+
+    $('#messageText').keypress(function(e) {
+        if (e.which == 13) {
+            e.preventDefault();
+            submitMessage();
+        }
+    });
+
+    var isProcessing = false;
+    var isRecordingVoice = false;
+    var voiceRecorder = null;
+    var voiceStream = null;
+    var voiceChunks = [];
+    var voiceStopTimer = null;
+    var VOICE_MAX_MS = 12000;
+
+    function showVoiceFailure(message) {
+        appendMessage(message, false, null, null, 'Faible');
+    }
+
+    function preferredAudioMimeType() {
+        if (!window.MediaRecorder || !MediaRecorder.isTypeSupported) {
+            return '';
+        }
+        var types = [
+            'audio/webm;codecs=opus',
+            'audio/webm',
+            'audio/ogg;codecs=opus',
+            'audio/ogg',
+            'audio/mp4'
+        ];
+        for (var i = 0; i < types.length; i += 1) {
+            if (MediaRecorder.isTypeSupported(types[i])) {
+                return types[i];
+            }
+        }
+        return '';
+    }
+
+    function audioFilename(mimeType) {
+        if (mimeType.indexOf('mp4') !== -1) {
+            return 'question.m4a';
+        }
+        if (mimeType.indexOf('ogg') !== -1) {
+            return 'question.ogg';
+        }
+        return 'question.webm';
+    }
+
+    function releaseVoiceStream() {
+        if (voiceStream) {
+            voiceStream.getTracks().forEach(function(track) {
+                track.stop();
+            });
+            voiceStream = null;
+        }
+    }
+
+    function setVoiceRecording(active) {
+        isRecordingVoice = active;
+        $('#chatbot-form-btn-voice')
+            .toggleClass('listening', active)
+            .prop('disabled', false)
+            .attr('aria-label', active ? 'Arrêter la dictée' : 'Dicter une question')
+            .attr('title', active ? 'Arrêter la dictée' : 'Dicter une question');
+
+        if (active) {
+            $('#messageText').prop('disabled', true);
+            $('#chatbot-form-btn').prop('disabled', true);
+            $('#chatbot-form-btn-image').prop('disabled', true);
+            $('#toolsToggle').prop('disabled', true);
+            $('.example-card').prop('disabled', true);
+            $('#weatherLocation').prop('disabled', true);
+            $('#weatherBtn').prop('disabled', true);
+            $('#soilCrop').prop('disabled', true);
+            $('#soilLocation').prop('disabled', true);
+            $('#soilBtn').prop('disabled', true);
+        } else if (!isProcessing) {
+            enableInput();
+        }
+    }
+
+    function speechErrorMessage(errorCode) {
+        if (errorCode === 'not-allowed' || errorCode === 'service-not-allowed') {
+            return "Le micro est bloqué. Vous pouvez taper votre question, ou autoriser le micro dans le navigateur puis réessayer.";
+        }
+        if (errorCode === 'audio-capture') {
+            return "Aucun micro n'a été détecté. Vérifiez le micro, puis réessayez.";
+        }
+        if (errorCode === 'no-speech') {
+            return "Aucune parole n'a été détectée. Parlez plus près du micro ou tapez votre question.";
+        }
+        if (errorCode === 'network') {
+            return "La dictée du navigateur a échoué à cause du réseau. Veuillez réessayer ou taper votre question.";
+        }
+        return "La dictée vocale a échoué. Veuillez réessayer ou taper votre question.";
+    }
+
+    function startNativeSpeechRecognition() {
+        var SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (!SpeechRecognition) {
+            showVoiceFailure("La dictée vocale n'est pas disponible dans ce navigateur. Veuillez taper votre question.");
+            return;
+        }
+
+        var recognition = new SpeechRecognition();
+        recognition.lang = 'fr-FR';
+        recognition.interimResults = false;
+        recognition.maxAlternatives = 1;
+
+        recognition.onstart = function() {
+            setVoiceRecording(true);
+        };
+
+        recognition.onresult = function(event) {
+            var speechResult = event.results[0][0].transcript;
+            $('#messageText').val(speechResult);
+            setVoiceRecording(false);
+            $('#messageText').focus();
+            $('#inputHint').text('Vérifiez la dictée, puis appuyez sur Envoyer.');
+        };
+
+        recognition.onerror = function(event) {
+            console.error('Speech recognition error:', event.error);
+            showVoiceFailure(speechErrorMessage(event.error));
+        };
+
+        recognition.onend = function() {
+            setVoiceRecording(false);
+        };
+
+        try {
+            recognition.start();
+        } catch (err) {
+            console.error('Speech recognition start failed:', err);
+            setVoiceRecording(false);
+            showVoiceFailure("La dictée vocale n'a pas pu démarrer. Veuillez taper votre question.");
+        }
+    }
+
+    function submitVoiceRecording(blob, mimeType) {
+        if (!blob || blob.size < 200) {
+            showVoiceFailure("L'enregistrement est trop court. Appuyez sur le micro et parlez clairement.");
+            return;
+        }
+
+        var formData = new FormData();
+        formData.append('audio', blob, audioFilename(mimeType));
+
+        isProcessing = true;
+        disableInput();
+        showTypingIndicator();
+
+        $.ajax({
+            type: "POST",
+            url: "/speech",
+            data: formData,
+            processData: false,
+            contentType: false,
+            success: function(response) {
+                removeTypingIndicator();
+                var transcript = (response.text || '').trim();
+                if (!transcript) {
+                    showVoiceFailure("Aucune parole claire n'a été détectée. Veuillez réessayer ou taper votre question.");
+                    isProcessing = false;
+                    enableInput();
+                    return;
+                }
+                $('#messageText').val(transcript);
+                isProcessing = false;
+                enableInput();
+                $('#messageText').focus();
+                $('#inputHint').text('Vérifiez la dictée, puis appuyez sur Envoyer.');
+            },
+            error: function(jqXHR) {
+                removeTypingIndicator();
+                var response = jqXHR.responseJSON || {};
+                showVoiceFailure(response.error || "La dictée vocale a échoué. Veuillez réessayer ou taper votre question.");
+                isProcessing = false;
+                enableInput();
+            }
+        });
+    }
+
+    function stopVoiceRecording() {
+        if (voiceStopTimer) {
+            clearTimeout(voiceStopTimer);
+            voiceStopTimer = null;
+        }
+        if (voiceRecorder && voiceRecorder.state !== 'inactive') {
+            voiceRecorder.stop();
+            return;
+        }
+        releaseVoiceStream();
+        setVoiceRecording(false);
+    }
+
+    function startServerVoiceInput() {
+        if (!window.isSecureContext && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') {
+            showVoiceFailure("La dictée vocale demande une page HTTPS. Ouvrez l'application depuis son URL Hugging Face.");
+            return;
+        }
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !window.MediaRecorder) {
+            startNativeSpeechRecognition();
+            return;
+        }
+
+        navigator.mediaDevices.getUserMedia({
+            audio: {
+                echoCancellation: true,
+                noiseSuppression: true
+            }
+        }).then(function(stream) {
+            var mimeType = preferredAudioMimeType();
+            var options = mimeType ? { mimeType: mimeType } : {};
+
+            voiceStream = stream;
+            voiceChunks = [];
+            voiceRecorder = new MediaRecorder(stream, options);
+
+            voiceRecorder.ondataavailable = function(event) {
+                if (event.data && event.data.size > 0) {
+                    voiceChunks.push(event.data);
+                }
+            };
+
+            voiceRecorder.onerror = function(event) {
+                console.error('MediaRecorder error:', event.error);
+                releaseVoiceStream();
+                setVoiceRecording(false);
+                showVoiceFailure("L'enregistrement vocal a échoué. Veuillez réessayer ou taper votre question.");
+            };
+
+            voiceRecorder.onstop = function() {
+                if (voiceStopTimer) {
+                    clearTimeout(voiceStopTimer);
+                    voiceStopTimer = null;
+                }
+                releaseVoiceStream();
+                setVoiceRecording(false);
+                var blob = new Blob(voiceChunks, { type: mimeType || 'audio/webm' });
+                voiceChunks = [];
+                submitVoiceRecording(blob, mimeType || 'audio/webm');
+            };
+
+            voiceRecorder.start();
+            setVoiceRecording(true);
+            voiceStopTimer = setTimeout(stopVoiceRecording, VOICE_MAX_MS);
+        }).catch(function(err) {
+            console.error('getUserMedia failed:', err);
+            var name = err && err.name ? err.name : '';
+            if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+                showVoiceFailure("Le micro est bloqué. Vous pouvez taper votre question, ou autoriser le micro dans le navigateur puis réessayer.");
+            } else if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
+                showVoiceFailure("Aucun micro n'a été détecté. Vérifiez le micro, puis réessayez.");
+            } else {
+                startNativeSpeechRecognition();
+            }
+        });
+    }
+
+    function setToolsOpen(open) {
+        $('#toolsDrawer').prop('hidden', !open);
+        $('#toolsToggle')
+            .attr('aria-expanded', open ? 'true' : 'false')
+            .toggleClass('active', open);
+    }
+
+    $('#toolsToggle').click(function(e) {
+        e.preventDefault();
+        if (isProcessing) {
+            return;
+        }
+        setToolsOpen($('#toolsDrawer').prop('hidden'));
+    });
+
+    function disableInput() {
+        $('#chatbot-form-btn-clear, .farmer-task').prop('disabled', true);
+        $('#messageText').prop('disabled', true);
+        $('#chatbot-form-btn').prop('disabled', true);
+        $('#chatbot-form-btn-voice').prop('disabled', true);
+        $('#chatbot-form-btn-image').prop('disabled', true);
+        $('#toolsToggle').prop('disabled', true);
+        $('.example-card').prop('disabled', true);
+        $('#weatherLocation').prop('disabled', true);
+        $('#weatherBtn').prop('disabled', true);
+        $('#soilCrop').prop('disabled', true);
+        $('#soilLocation').prop('disabled', true);
+        $('#soilBtn').prop('disabled', true);
+    }
+
+    function enableInput() {
+        $('#chatbot-form-btn-clear, .farmer-task').prop('disabled', false);
+        $('#messageText').prop('disabled', false);
+        $('#chatbot-form-btn').prop('disabled', false);
+        $('#chatbot-form-btn-voice').prop('disabled', false);
+        $('#chatbot-form-btn-image').prop('disabled', false);
+        $('#toolsToggle').prop('disabled', false);
+        $('.example-card').prop('disabled', false);
+        $('#weatherLocation').prop('disabled', false);
+        $('#weatherBtn').prop('disabled', false);
+        $('#soilCrop').prop('disabled', false);
+        $('#soilLocation').prop('disabled', false);
+        $('#soilBtn').prop('disabled', false);
+    }
+
+    function loadDemoExample(exampleId, prompt) {
+        if (!exampleId || isProcessing) {
+            return;
+        }
+        isProcessing = true;
+        disableInput();
+        appendMessage(prompt, true);
+        showTypingIndicator();
+
+        api.loadDemoExample(exampleId)
+            .then(function(response) {
+                removeTypingIndicator();
+                if (response.error) {
+                    appendMessage("Erreur : " + response.error, false, null, null, response.confidence);
+                } else if (response.case) {
+                    appendCaseMessage(
+                        response.case,
+                        response.answer,
+                        response.sources,
+                        response.confidence,
+                        response.audio_url,
+                        prompt,
+                        response.journal
+                    );
+                } else {
+                    appendMessage(response.answer, false, response.sources, prompt, response.confidence, '', response.journal);
+                }
+                isProcessing = false;
+                enableInput();
+            })
+            .catch(function() {
+                removeTypingIndicator();
+                appendMessage("Désolé, cet exemple n'est pas disponible pour le moment.", false, null, null, 'Faible');
+                isProcessing = false;
+                enableInput();
+            });
+    }
+
+    function showWeatherContext(locationId, locationName) {
+        if (!locationId || isProcessing) {
+            return;
+        }
+        setToolsOpen(false);
+        isProcessing = true;
+        disableInput();
+        appendMessage('Météo agricole - ' + locationName, true);
+        showTypingIndicator();
+
+        api.loadWeatherContext(locationId)
+            .then(function(response) {
+                removeTypingIndicator();
+                if (response.error) {
+                    appendMessage("Erreur : " + response.error, false, null, null, response.confidence);
+                } else {
+                    appendWeatherMessage(response.weather);
+                }
+                isProcessing = false;
+                enableInput();
+            })
+            .catch(function() {
+                removeTypingIndicator();
+                appendMessage("Désolé, la météo agricole n'est pas disponible pour le moment.", false, null, null, 'Faible');
+                isProcessing = false;
+                enableInput();
+            });
+    }
+
+    function showSoilContext(locationId, locationName, cropId, cropName) {
+        if (!locationId || !cropId || isProcessing) {
+            return;
+        }
+        setToolsOpen(false);
+        isProcessing = true;
+        disableInput();
+        appendMessage('Sol + engrais - ' + cropName + ' / ' + locationName, true);
+        showTypingIndicator();
+
+        api.loadSoilContext(locationId, cropId)
+            .then(function(response) {
+                removeTypingIndicator();
+                if (response.error) {
+                    appendMessage("Erreur : " + response.error, false, null, null, response.confidence);
+                } else {
+                    appendSoilMessage(response.soil, response.fertilizer, response.confidence);
+                }
+                isProcessing = false;
+                enableInput();
+            })
+            .catch(function() {
+                removeTypingIndicator();
+                appendMessage("Désolé, le contexte sol n'est pas disponible pour le moment.", false, null, null, 'Faible');
+                isProcessing = false;
+                enableInput();
+            });
+    }
+
+    function getFieldLocationValue() {
+        var selected = ($('#fieldLocationSelect').val() || '').trim();
+        if (selected === '__custom__') {
+            return ($('#fieldLocationCustom').val() || '').trim();
+        }
+        return selected;
+    }
+
+    var FIELD_STORAGE_KEY = 'dakikobo_field_context_v1';
+    var _cropLabelCache = null;
+
+    function isSimpleFrenchEnabled() {
+        return $('#simpleFrenchToggle').is(':checked');
+    }
+
+    function getFieldContext() {
+        return {
+            crop: ($('#fieldCrop').val() || '').trim(),
+            growth_stage: ($('#fieldStage').val() || '').trim(),
+            location: getFieldLocationValue(),
+            simple_french: isSimpleFrenchEnabled()
+        };
+    }
+
+    function saveFieldContextToStorage() {
+        try {
+            var selected = ($('#fieldLocationSelect').val() || '').trim();
+            var payload = {
+                crop: ($('#fieldCrop').val() || '').trim(),
+                growth_stage: ($('#fieldStage').val() || '').trim(),
+                location_select: selected,
+                location_custom: ($('#fieldLocationCustom').val() || '').trim(),
+                simple_french: isSimpleFrenchEnabled()
+            };
+            window.localStorage.setItem(FIELD_STORAGE_KEY, JSON.stringify(payload));
+        } catch (e) {
+            // Private mode / blocked storage — ignore.
+        }
+    }
+
+    function loadFieldContextFromStorage() {
+        try {
+            var raw = window.localStorage.getItem(FIELD_STORAGE_KEY);
+            if (!raw) {
+                return;
+            }
+            var data = JSON.parse(raw);
+            if (data.crop && $('#fieldCrop option[value="' + data.crop + '"]').length) {
+                $('#fieldCrop').val(data.crop);
+            }
+            if (data.growth_stage && $('#fieldStage option[value="' + data.growth_stage + '"]').length) {
+                $('#fieldStage').val(data.growth_stage);
+            }
+            if (data.location_select) {
+                if ($('#fieldLocationSelect option[value="' + data.location_select + '"]').length) {
+                    $('#fieldLocationSelect').val(data.location_select);
+                }
+                var isCustom = data.location_select === '__custom__';
+                $('#fieldLocationCustom').prop('hidden', !isCustom);
+                if (isCustom && data.location_custom) {
+                    $('#fieldLocationCustom').val(data.location_custom);
+                }
+            }
+            if (typeof data.simple_french === 'boolean') {
+                $('#simpleFrenchToggle').prop('checked', data.simple_french);
+            }
+        } catch (e) {
+            // Ignore corrupt storage.
+        }
+    }
+
+
+    function populateRegistrySelects(crops, places) {
+        if (crops.length && $('#fieldCrop').length) {
+            var $crop = $('#fieldCrop');
+            var selectedCrop = $crop.val() || '';
+            var $blank = $crop.find('option[value=""]').detach();
+            var $autre = $crop.find('option[value="autre"]').detach();
+            $crop.empty();
+            if ($blank.length) { $crop.append($blank); }
+            crops.forEach(function(crop) {
+                $crop.append($('<option>', { value: crop.id, text: crop.label_fr }));
+            });
+            if ($autre.length) { $crop.append($autre); }
+            $crop.val(selectedCrop);
+            // Re-apply cached labels in case /crop-labels resolved first.
+            if (_cropLabelCache && _cropLabelCache.length) {
+                applyCropLabels(_cropLabelCache);
+            }
+        }
+        if (places.length && $('#fieldLocationSelect').length) {
+            var $loc = $('#fieldLocationSelect');
+            var $blankLoc = $loc.find('option[value=""]').detach();
+            var $custom = $loc.find('option[value="__custom__"]').detach();
+            $loc.empty();
+            if ($blankLoc.length) { $loc.append($blankLoc); }
+            places.forEach(function(place) {
+                $loc.append($('<option>', { value: place.id, text: place.label_fr }));
+            });
+            if ($custom.length) { $loc.append($custom); }
+        }
+
+        var weatherPlaces = places.filter(function(place) {
+            return place.has_weather;
+        });
+        ['#weatherLocation', '#soilLocation'].forEach(function(selector) {
+            var $select = $(selector);
+            if (!$select.length) {
+                return;
+            }
+            $select.empty();
+            weatherPlaces.forEach(function(place) {
+                $select.append($('<option>', {
+                    value: place.id,
+                    text: place.label_fr
+                }));
+            });
+        });
+
+        var $soilCrop = $('#soilCrop');
+        if ($soilCrop.length) {
+            $soilCrop.empty();
+            crops.filter(function(crop) {
+                return crop.fertilizer_supported;
+            }).forEach(function(crop) {
+                $soilCrop.append($('<option>', {
+                    value: crop.id,
+                    text: crop.label_fr
+                }));
+            });
+        }
+    }
+
+    function syncToolsFromFieldLocation() {
+        var selected = ($('#fieldLocationSelect').val() || '').trim();
+        if (!selected || selected === '__custom__') {
+            return;
+        }
+        // selected is now a place id (e.g. 'ouagadougou'); use directly.
+        if ($('#weatherLocation option[value="' + selected + '"]').length) {
+            $('#weatherLocation').val(selected);
+        }
+        if ($('#soilLocation option[value="' + selected + '"]').length) {
+            $('#soilLocation').val(selected);
+        }
+        var crop = ($('#fieldCrop').val() || '').trim();
+        if (crop && crop !== 'autre' && $('#soilCrop').length) {
+            if ($('#soilCrop option[value="' + crop + '"]').length) {
+                $('#soilCrop').val(crop);
+            }
+        }
+    }
+
+    $('#fieldLocationSelect').on('change', function() {
+        var isCustom = $(this).val() === '__custom__';
+        $('#fieldLocationCustom').prop('hidden', !isCustom);
+        if (isCustom) {
+            $('#fieldLocationCustom').trigger('focus');
+        } else {
+            $('#fieldLocationCustom').val('');
+            syncToolsFromFieldLocation();
+        }
+        saveFieldContextToStorage();
+    });
+
+    $('#fieldCrop').on('change', function() {
+        syncToolsFromFieldLocation();
+        saveFieldContextToStorage();
+        updateFieldContextToggleLabel();
+    });
+
+    $('#fieldStage').on('change', function() {
+        saveFieldContextToStorage();
+        updateFieldContextToggleLabel();
+    });
+
+    $('#fieldLocationCustom').on('change input', function() {
+        saveFieldContextToStorage();
+        updateFieldContextToggleLabel();
+    });
+
+    $('#simpleFrenchToggle').on('change', function() {
+        applyCropLabels(_cropLabelCache || []);
+        saveFieldContextToStorage();
+        updateFieldContextToggleLabel();
+    });
+
+    function fieldContextLabel(ctx) {
+        var parts = [];
+        if (ctx.crop) {
+            parts.push('Culture : ' + ctx.crop);
+        }
+        if (ctx.growth_stage) {
+            parts.push('Stade : ' + ctx.growth_stage);
+        }
+        if (ctx.location) {
+            parts.push('Lieu : ' + ctx.location);
+        }
+        if (ctx.simple_french) {
+            parts.push('Français simple');
+        }
+        return parts.join(' · ');
+    }
+
+    function setFieldContextOpen(open) {
+        var $fields = $('#fieldContextFields');
+        var $toggle = $('#fieldContextToggle');
+        if (!$fields.length || !$toggle.length) {
+            return;
+        }
+        $fields.prop('hidden', !open);
+        $toggle.attr('aria-expanded', open ? 'true' : 'false');
+        updateFieldContextToggleLabel();
+    }
+
+    function updateFieldContextToggleLabel() {
+        var $label = $('#fieldContextToggleLabel');
+        if (!$label.length) {
+            return;
+        }
+        var open = $('#fieldContextToggle').attr('aria-expanded') === 'true';
+        if (open) {
+            $label.text('Contexte parcelle');
+            return;
+        }
+        var ctx = getFieldContext();
+        // Simple French is a separate, always-visible control. Do not make the
+        // collapsed field-context button look like it controls that setting.
+        ctx.simple_french = false;
+        var summary = fieldContextLabel(ctx);
+        if (summary) {
+            $label.text(summary.length > 42 ? summary.slice(0, 40) + '…' : summary);
+        } else {
+            $label.text('Contexte parcelle (optionnel)');
+        }
+    }
+
+    function setExamplesOpen(open) {
+        var $wrap = $('#examplesListWrap');
+        var $toggle = $('#examplesToggle');
+        if (!$wrap.length || !$toggle.length) {
+            return;
+        }
+        $wrap.prop('hidden', !open);
+        $toggle.attr('aria-expanded', open ? 'true' : 'false');
+    }
+
+    $('#fieldContextToggle').on('click', function() {
+        setFieldContextOpen($('#fieldContextFields').prop('hidden'));
+    });
+
+    $('#examplesToggle').on('click', function() {
+        setExamplesOpen($('#examplesListWrap').prop('hidden'));
+    });
+
+    // Keep the last substantive user question so short follow-ups
+    // ("ok à Ouagadougou") stay on topic server-side.
+    var lastUserQuestion = '';
+
+    function looksLikeShortFollowup(text) {
+        var t = (text || '').trim();
+        if (!t) {
+            return false;
+        }
+        var words = t.split(/\s+/).filter(Boolean);
+        if (words.length > 12) {
+            return false;
+        }
+        if (/^(ok|oui|non|et|donc|alors|merci)\b/i.test(t) && words.length <= 8) {
+            return true;
+        }
+        // Place-only style clarifications without a long new topic.
+        if (words.length <= 6 && !/\b(sorgho|mil|ma[iï]s|ni[eé]b[eé]|arachide|soja|coton|riz)\b/i.test(t)) {
+            return true;
+        }
+        return false;
+    }
+
+    function submitMessage() {
+        var message = $('#messageText').val().trim();
+        if (message && !isProcessing) {
+            isProcessing = true;
+            disableInput();
+
+            var ctx = getFieldContext();
+            var display = message;
+            var ctxLabel = fieldContextLabel(ctx);
+            if (ctxLabel) {
+                display = message + '\n(' + ctxLabel + ')';
+            }
+
+            var prior = '';
+            if (looksLikeShortFollowup(message) && lastUserQuestion) {
+                prior = lastUserQuestion;
+            }
+
+            appendMessage(display, true);
+            $('#messageText').val('');
+            showTypingIndicator();
+
+            api.sendMessage({
+                    messageText: message,
+                    crop: ctx.crop,
+                    growth_stage: ctx.growth_stage,
+                    location: ctx.location,
+                    simple_french: ctx.simple_french ? '1' : '0',
+                    prior_question: prior
+                })
+                .then(function(response) {
+                    removeTypingIndicator();
+                    if (response.error) {
+                        appendMessage("Erreur : " + response.error, false, null, null, response.confidence);
+                    } else {
+                        var answer = response.answer;
+                        var audioUrl = response.audio_url;
+                        var sources = response.sources;
+
+                        // Remember this turn for the next short follow-up.
+                        if (!looksLikeShortFollowup(message)) {
+                            lastUserQuestion = message;
+                        } else if (prior) {
+                            lastUserQuestion = prior + ' ' + message;
+                        } else {
+                            lastUserQuestion = message;
+                        }
+
+                        if (response.case) {
+                            appendCaseMessage(
+                                response.case,
+                                answer,
+                                sources,
+                                response.confidence,
+                                audioUrl,
+                                message,
+                                response.journal
+                            );
+                        } else {
+                            appendMessage(answer, false, sources, message, response.confidence, audioUrl, response.journal);
+                        }
+
+                        if ($('#voiceReadingCheckbox').is(':checked') && audioUrl) {
+                            playAudio(audioUrl);
+                        }
+                    }
+                    isProcessing = false;
+                    enableInput();
+                })
+                .catch(function(error) {
+                    removeTypingIndicator();
+                    console.log(error);
+                    var errPayload = error && error.payload;
+                    var errText = (errPayload && errPayload.answer)
+                        ? errPayload.answer
+                        : "Désolé, une erreur est survenue pendant le traitement. Veuillez réessayer plus tard.";
+                    appendMessage(errText, false, null, null, (errPayload && errPayload.confidence) || 'Faible');
+                    isProcessing = false;
+                    enableInput();
+                });
+        }
+    }
+
+    function appendImageMessage(dataUrl) {
+        var el = $('<div class="message-container user-container">' +
+                   '<div class="message user-message"></div>' +
+                   '<div class="user-image"><img src="/static/images/user_avatar.png" alt="User"></div>' +
+                   '</div>');
+        el.find('.message').append($('<img class="msg-image" alt="photo">').attr('src', dataUrl));
+        $('.chat-messages').append(el);
+        $('.chat-messages').scrollTop($('.chat-messages')[0].scrollHeight);
+    }
+
+    function appendImageContextForm(file) {
+        var logoHTML = '<div class="bot-logo"><img src="' + BOT_AVATAR + '" alt="' + BOT_AVATAR_ALT + '"></div>';
+        var messageElement = $('<div class="message-container bot-container">' +
+                            logoHTML +
+                            '<div class="message bot-message context-message"></div>' +
+                           '</div>');
+        var bubble = messageElement.find('.message');
+        var $form = $('<form class="image-context-form"></form>');
+
+        $form.append($('<div class="context-title"></div>').text("Avant l'analyse"));
+
+        var $grid = $('<div class="context-grid"></div>');
+        var fieldCtx = getFieldContext();
+        var $crop = $('<select name="crop" aria-label="Culture"></select>');
+        [
+            ['', 'Culture : je ne sais pas'],
+            ['maïs', 'Maïs'],
+            ['mil', 'Mil'],
+            ['sorgho', 'Sorgho'],
+            ['niébé', 'Niébé'],
+            ['arachide', 'Arachide'],
+            ['autre', 'Autre culture']
+        ].forEach(function(opt) {
+            $crop.append($('<option></option>').val(opt[0]).text(opt[1]));
+        });
+        if (fieldCtx.crop) {
+            $crop.val(fieldCtx.crop);
+        }
+
+        var $stage = $('<select name="growth_stage" aria-label="Stade de croissance"></select>');
+        [
+            ['', 'Stade : je ne sais pas'],
+            ['levée / jeune plant', 'Levée / jeune plant'],
+            ['croissance végétative', 'Croissance végétative'],
+            ['floraison', 'Floraison'],
+            ['fructification / épi', 'Fructification / épi'],
+            ['maturité', 'Maturité']
+        ].forEach(function(opt) {
+            $stage.append($('<option></option>').val(opt[0]).text(opt[1]));
+        });
+        if (fieldCtx.growth_stage) {
+            $stage.val(fieldCtx.growth_stage);
+        }
+
+        var $location = $('<input type="text" name="location" maxlength="120" autocomplete="off" placeholder="Commune ou village (optionnel)">');
+        if (fieldCtx.location) {
+            $location.val(fieldCtx.location);
+        }
+        $grid.append($crop).append($stage).append($location);
+
+        var $actions = $('<div class="context-actions"></div>');
+        var $submit = $('<button type="submit" class="context-submit">Analyser</button>');
+        var $skip = $('<button type="button" class="context-skip">Je ne sais pas</button>');
+        $actions.append($submit).append($skip);
+
+        $form.append($grid).append($actions);
+        bubble.append($form);
+        $('.chat-messages').append(messageElement);
+        $('.chat-messages').scrollTop($('.chat-messages')[0].scrollHeight);
+
+        function submitContext(useUnknown) {
+            var context = {
+                crop: useUnknown ? '' : $crop.val(),
+                growth_stage: useUnknown ? '' : $stage.val(),
+                location: useUnknown ? '' : $location.val().trim()
+            };
+            $form.find('input, select, button').prop('disabled', true);
+            $form.addClass('submitted');
+            submitImageForScreening(file, context);
+        }
+
+        $form.on('submit', function(e) {
+            e.preventDefault();
+            submitContext(false);
+        });
+
+        $skip.on('click', function() {
+            submitContext(true);
+        });
+    }
+
+    function submitImageForScreening(file, context) {
+        showTypingIndicator();
+
+        api.uploadImageForScreening(
+            file,
+            context.crop || '',
+            context.growth_stage || '',
+            context.location || '',
+            isSimpleFrenchEnabled(),
+            context.question || "Photo maladie"
+        )
+            .then(function(response) {
+                removeTypingIndicator();
+                if (response.error) {
+                    appendMessage("Erreur : " + response.error, false, null, null, response.confidence);
+                } else {
+                    if (response.case) {
+                        appendCaseMessage(
+                            response.case,
+                            response.answer,
+                            response.sources,
+                            response.confidence,
+                            response.audio_url,
+                            context.question || "Photo maladie",
+                            response.journal
+                        );
+                    } else {
+                        appendMessage(response.answer, false, response.sources, null, response.confidence, response.audio_url);
+                    }
+                    if ($('#voiceReadingCheckbox').is(':checked') && response.audio_url) {
+                        playAudio(response.audio_url);
+                    }
+                }
+                isProcessing = false;
+                enableInput();
+            })
+            .catch(function() {
+                removeTypingIndicator();
+                appendMessage("Désolé, l'analyse de l'image a échoué. Veuillez réessayer.", false, null, null, 'Faible');
+                isProcessing = false;
+                enableInput();
+            });
+    }
+
+    // Leaf-photo disease screening (Gemini Vision via /screen)
+    $('#chatbot-form-btn-image').click(function(e) {
+        e.preventDefault();
+        if (!isProcessing) {
+            $('#imageInput').click();
+        }
+    });
+
+    $('#imageInput').change(function() {
+        var file = this.files[0];
+        this.value = '';  // allow re-selecting the same file later
+        if (!file || isProcessing) {
+            return;
+        }
+        isProcessing = true;
+        disableInput();
+
+        var reader = new FileReader();
+        reader.onload = function(ev) {
+            appendImageMessage(ev.target.result);
+            appendImageContextForm(file);
+        };
+        reader.readAsDataURL(file);
+    });
+
+    $('#weatherBtn').click(function(e) {
+        e.preventDefault();
+        if (isProcessing) {
+            return;
+        }
+        var $selected = $('#weatherLocation option:selected');
+        showWeatherContext($selected.val(), $selected.text());
+    });
+
+    $('#soilBtn').click(function(e) {
+        e.preventDefault();
+        if (isProcessing) {
+            return;
+        }
+        var $location = $('#soilLocation option:selected');
+        var $crop = $('#soilCrop option:selected');
+        showSoilContext($location.val(), $location.text(), $crop.val(), $crop.text());
+    });
+
+    // Welcome message (French — primary language for Burkina Faso farmers)
+    // Keep chat first: context + examples collapsed by default (more space to talk).
+    function initFieldContext() {
+        loadFieldContextFromStorage();
+        setFieldContextOpen(false);
+        setExamplesOpen(false);
+        syncToolsFromFieldLocation();
+        updateFieldContextToggleLabel();
+    }
+
+    // Optional French labels from /crop-labels (local-language slots stay unused).
+    function applyCropLabels(crops) {
+        if (!crops || !crops.length || !$('#fieldCrop').length) {
+            return;
+        }
+        _cropLabelCache = crops;
+        var byId = {};
+        crops.forEach(function(c) {
+            if (c && c.id) {
+                var registryId = {
+                    'maïs': 'mais',
+                    'niébé': 'niebe'
+                }[c.id] || c.id;
+                byId[registryId] = c;
+            }
+        });
+        var useSimple = isSimpleFrenchEnabled();
+        $('#fieldCrop option').each(function() {
+            var val = $(this).val();
+            if (!val || val === 'autre') {
+                return;
+            }
+            var meta = byId[val];
+            if (!meta) {
+                return;
+            }
+            var label = useSimple && meta.fr_simple ? meta.fr_simple : meta.fr;
+            if (label) {
+                $(this).text(label);
+            }
+        });
+    }
+
+    // Populate selects from the canonical registry first, then init the context.
+    // If it fails, chat and custom-location entry remain usable without stale ids.
+    api.loadRegistry()
+        .then(function(data) {
+            populateRegistrySelects(data.crops || [], data.places || []);
+        })
+        .catch(function() {
+            // Custom location entry remains usable without the registry.
+        })
+        .finally(function() {
+            initFieldContext();
+        });
+
+    api.loadCropLabels()
+        .then(function(data) {
+            applyCropLabels(data.crops || []);
+        })
+        .catch(function() {
+            // Registry labels remain the default when this optional glossary fails.
+        });
+
+        $('.farmer-task').on('click', function() {
+            $('#messageText').val($(this).attr('data-question')).focus();
+            $('#inputHint').text('Précisez la culture et votre question, puis envoyez.');
+        });
+        function setJournalOpen(open) {
+            var $panel = $('#journalPanel').prop('hidden', !open);
+            $('#journalToggle').attr('aria-expanded', open ? 'true' : 'false');
+            if (open) { $('#journalClose').focus(); }
+            else { $('#journalToggle').focus(); }
+            return $panel;
+        }
+        function showJournal() {
+            var $panel = setJournalOpen(true);
+            $('#journalClose').focus();
+            $panel.find('.journal-content').text('Chargement de vos conseils…');
+            DakiKoboApi.loadJournal().then(function(payload) {
+                var $content = $panel.find('.journal-content').empty();
+                if (!payload.cases.length) { $content.text('Aucun conseil enregistré sur ce navigateur.'); }
+                payload.cases.forEach(function(item) {
+                    var $item = $('<article class="journal-entry"></article>');
+                    $item.append($('<h3></h3>').text(item.question));
+                    $item.append($('<p></p>').text('Enregistré le ' + new Date(item.created_at).toLocaleDateString('fr-FR') + '. Conseil historique : vérifiez les conditions actuelles.'));
+                    $item.append($('<p class="journal-answer"></p>').text(item.answer));
+                    // Replay the saved source cards (with their declared scope).
+                    // Legacy cases without stored sources simply show none.
+                    if (item.sources && item.sources.length) {
+                        renderSources($item, item.sources);
+                    }
+                    if (item.outcome) { $item.append($('<p></p>').text('Suivi enregistré.')); }
+                    else {
+                        if (item.follow_up_due_at * 1000 <= Date.now()) { $item.append($('<p></p>').text('C’est le moment de noter le résultat.')); }
+                        DakiKoboRender.create($, DakiKoboApi).renderFollowupPrompt($item, item.feedback_id);
+                    }
+                    $('<button type="button">Supprimer ce conseil</button>').on('click', function() {
+                        if (!window.confirm('Supprimer ce conseil et ses photos de votre journal ?')) { return; }
+                        DakiKoboApi.deleteJournal(item.feedback_id).then(showJournal).catch(function() { $('#journalStatus').text('Suppression impossible. Réessayez avec une connexion.'); });
+                    }).appendTo($item);
+                    $content.append($item);
+                });
+            }).catch(function() { $panel.find('.journal-content').text('Le journal privé demande une connexion. Vos réponses récentes restent disponibles hors ligne en reposant la même question.'); });
+        }
+        $('#journalToggle').on('click', showJournal);
+        $('#journalClose').on('click', function() { setJournalOpen(false); });
+        $('#clearDeviceData').on('click', function() {
+            if (!window.confirm('Effacer les réponses et préférences enregistrées sur cet appareil ? Le journal privé sur le serveur reste disponible.')) { return; }
+            DakiKoboApi.clearDeviceData().then(function() { window.location.reload(); }).catch(function() { $('#journalStatus').text('Impossible d’effacer les données locales. Réessayez.'); });
+        });
+        $('#deleteJournal').on('click', function() {
+            if (!window.confirm('Supprimer tous vos conseils et leurs photos du serveur ?')) { return; }
+            DakiKoboApi.deleteJournal().then(showJournal).catch(function() { $('#journalStatus').text('Suppression impossible. Reconnectez-vous.'); });
+        });
+        var welcomeMessage = "🌾 Bienvenue. Écrivez votre question ci-dessous, ou utilisez 📷 pour une feuille. Ouvrez « Contexte parcelle » ou « Exemples » seulement si besoin. Conseils prudents, sourcés, à confirmer avec un agent agricole.";
+
+    $('#chatbot-form-btn-clear').click(function(e) {
+        e.preventDefault();
+        if (isProcessing || isRecordingVoice) { return; }
+        lastUserQuestion = '';
+        stopCurrentAudio();
+        $('.chat-messages').empty();
+        appendMessage(welcomeMessage, false);
+    });
+
+    $('#chatbot-form-btn-voice').click(function(e) {
+        e.preventDefault();
+        if (isRecordingVoice) {
+            stopVoiceRecording();
+            return;
+        }
+        if (isProcessing) {
+            showVoiceFailure("Une réponse est déjà en cours. Attendez la fin avant de dicter une question.");
+            return;
+        }
+        startServerVoiceInput();
+    });
+
+    $('#voiceReadingCheckbox').change(function() {
+        if (!$(this).is(':checked')) {
+            stopCurrentAudio();
+        }
+    });
+
+    setTimeout(function() {
+        appendMessage(welcomeMessage, false);
+    }, 500);
+
+    function setOfflineBanner(visible) {
+        $('#offlineBanner').prop('hidden', !visible);
+    }
+
+    setOfflineBanner(!navigator.onLine);
+    // Replay any follow-up outcomes recorded while offline in a previous session.
+    if (navigator.onLine && api.flushOutcomeQueue) {
+        api.flushOutcomeQueue().catch(function() { /* stays queued for the next reconnection */ });
+    }
+    window.addEventListener('offline', function() { setOfflineBanner(true); });
+    window.addEventListener('online', function() { setOfflineBanner(false); });
+    window.addEventListener('dakikobo:offline-fallback', function() { setOfflineBanner(true); });
+
+    if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.register('/sw.js', { scope: '/' }).then(function() {
+            return navigator.serviceWorker.ready;
+        }).then(function() { $('#offlineReady').text('Application préparée pour une utilisation hors ligne.'); }).catch(function(error) {
+            $('#offlineReady').text('Préparation hors ligne indisponible. Réessayez avec une connexion.');
+            console.warn("Le mode hors ligne n'a pas pu être activé.", error);
+        });
+    }
+});
