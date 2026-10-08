@@ -8,7 +8,15 @@ preload_from_hub:
   - sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
 ---
 
-# DakiKobo — AI Agricultural Advisor for Burkina Faso 🌾
+# DakiKobo — Kiro showcase edition 🌾
+
+> This public repository is a Kiro-ready showcase snapshot derived from the
+> earlier [`MORAWA-dev/dakikobo`](https://github.com/MORAWA-dev/dakikobo)
+> project. The application predates this repository. See
+> [`KIRO_SHOWCASE.md`](KIRO_SHOWCASE.md) for provenance, Kiro artifacts, and the
+> activation evidence still requiring a real Kiro IDE session. This repository
+> was created after the Kiro University submission deadline and is not presented
+> as an on-time challenge entry.
 
 DakiKobo is a French-language AI assistant for smallholder farmers in Burkina Faso.
 It uses a **Retrieval-Augmented Generation (RAG)** pipeline restricted to reviewed
