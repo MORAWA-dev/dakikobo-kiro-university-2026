@@ -16,7 +16,9 @@ preload_from_hub:
 > [`KIRO_SHOWCASE.md`](KIRO_SHOWCASE.md) for provenance, Kiro artifacts, and the
 > activation evidence still requiring a real Kiro IDE session. This repository
 > was created after the Kiro University submission deadline and is not presented
-> as an on-time challenge entry.
+> as an on-time challenge entry. A paid Kiro subscription is not required to
+> inspect these artifacts; see the showcase guide for the limited free-tier
+> confirmation workflow and its evidence boundaries.
 
 DakiKobo is a French-language AI assistant for smallholder farmers in Burkina Faso.
 It uses a **Retrieval-Augmented Generation (RAG)** pipeline restricted to reviewed

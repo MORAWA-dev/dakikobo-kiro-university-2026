@@ -10,6 +10,22 @@ The Kiro University submission window described by the owner closed on
 5 October 2026. This repository was initialized after that deadline and must not
 be represented as an on-time entry.
 
+## Account and subscription status
+
+This repository does not require a paid Kiro subscription. Its specifications,
+steering, hook, MCP configuration, custom agent, and Power are ordinary tracked
+files and remain publicly reviewable without a Kiro account.
+
+As of 8 October 2026, Kiro advertises a free plan with 50 monthly credits. The
+repository owner reported that the paid subscription is no longer active; the
+owner's exact account tier and remaining credits have not been independently
+verified. Any future form or demonstration must say **Kiro Free** only after the
+owner confirms that label in Kiro's Account & Billing screen.
+
+The interactive evidence below can be attempted with free credits. If a request
+is paused because the monthly limit has been reached, retain the configuration
+and wait for the next reset rather than claiming that the interaction ran.
+
 ## Kiro artifacts
 
 | Capability | Repository evidence | Activation evidence |
@@ -25,6 +41,20 @@ be represented as an on-time entry.
 Configuration files are evidence of preparation. A form answer should claim
 actual use only after the corresponding Kiro interaction has been performed and
 shown in the demo video.
+
+### Minimal free-tier confirmation run
+
+1. Sign in to Kiro with the same provider used for the challenge account.
+2. Open this repository and confirm that `.kiro/steering/` is loaded.
+3. Select `agronomy-safety-reviewer` and ask it to review the greeting route.
+4. Save one Python file without changing its behavior and capture the successful
+   `python-syntax-check` hook result.
+5. Enable the workspace MCP server and demonstrate one read-only file listing.
+6. In Kiro IDE, open the grounded-answer spec and run its correctness property
+   only if sufficient free credits remain.
+
+Record only steps that actually complete. Static files alone do not prove an
+interactive lesson was demonstrated.
 
 ## Verification
 
