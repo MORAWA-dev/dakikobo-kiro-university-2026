@@ -2211,3 +2211,19 @@ cd - && git worktree remove "$WT" --force
   still admitted the institutional chunk. Tightened the rule to require a real
   weed/desherbage concept in the chunk and extended the regressions with that
   live-shaped false match before redeploying.
+
+### 2026-10-08 — Publish transparent Kiro showcase edition
+
+- Created a fresh public repository at
+  `https://github.com/MORAWA-dev/dakikobo-kiro-university-2026` from the verified
+  DakiKobo snapshot, with explicit attribution to the earlier project and an
+  October 8 root commit. The repository is intentionally not represented as an
+  on-time Kiro University submission because the stated deadline had passed.
+- Added workspace steering, a grounded-answer safety spec, a Python quality
+  hook, a read-only repository MCP configuration, and a custom agronomy safety
+  reviewer under `.kiro/`.
+- Added the reusable `kiro-power-dakikobo-safety` Power with a validated
+  `review-grounding` skill. `KIRO_SHOWCASE.md` distinguishes configuration
+  preparation from evidence that requires an actual Kiro IDE interaction.
+- GitHub verification on commit `93a9594` succeeded for offline regression,
+  Docker build, Docker journal continuity, and the headless Chromium rehearsal.
